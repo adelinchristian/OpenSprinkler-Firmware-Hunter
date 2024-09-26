@@ -26,8 +26,10 @@
 
 #if !defined(ARDUINO)
 #include <stdarg.h>
-#include <unistd.h>
+#else 
+#include <Arduino.h>
 #endif
+#include <utils.h>
 
 char dec2hexchar(unsigned char dec);
 

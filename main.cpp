@@ -813,7 +813,7 @@ void do_loop()
 					if(!((bitvalue >> s) & 1)) {
 						if (curr_time >= q->st && curr_time < q->st+q->dur) {
 							turn_on_station(sid, q->st+q->dur-curr_time); // the last parameter is expected run time
-//todo?							HunterStart(sid+1,round((q->dur/60)+0.5)); // Starts X-Core Hunter zone for 'dur' minutes +1
+							HunterStart(sid+1,round((q->dur/60)+0.5)); // Starts X-Core Hunter zone for 'dur' minutes +1
 						} //if curr_time > scheduled_start_time
 					} // if current station is not running
 
@@ -940,22 +940,23 @@ void do_loop()
 		if (!ui_state) { os.lcd_print_screen(ui_anim_chars[(unsigned long)curr_time%3]); }
 		
 		//TODO hunter:
-		// if (!ui_state) {
-		// 	os.lcd_print_screen(ui_anim_chars[(unsigned long)curr_time%3]);
-		// 	#if defined(ESP8266)
-		// 	if(os.get_wifi_mode()==WIFI_MODE_STA && WiFi.status()==WL_CONNECTED && WiFi.localIP()) {
-		// 		os.lcd.setCursor(0, 2);
-		// 		os.lcd.clear(2, 2);
-		// 		if(os.status.program_busy) {
-		// 			//os.lcd.print(F("curr: "));
-        //   os.lcd.print(F("A0: ")); // 3B => show mV on A0 from hunter P pin
-		// 			uint16_t curr = os.read_current();
-		// 			os.lcd.print(curr);
-		// 			//os.lcd.print(F(" mA"));
-        //   os.lcd.print(F(" mV")); // 3B => show mV on A0 from hunter P pin
-		// 		}
-		// 	}
-		// }
+		if (!ui_state) {
+			os.lcd_print_screen(ui_anim_chars[(unsigned long)curr_time%3]);
+			#if defined(ESP8266)
+				if(os.get_wifi_mode()==WIFI_MODE_STA && WiFi.status()==WL_CONNECTED && WiFi.localIP()) {
+					os.lcd.setCursor(0, 2);
+					os.lcd.clear(2, 2);
+					if(os.status.program_busy) {
+						//os.lcd.print(F("curr: "));
+						os.lcd.print(F("A0: ")); // 3B => show mV on A0 from hunter P pin
+						uint16_t curr = os.read_current();
+						os.lcd.print(curr);
+						//os.lcd.print(F(" mA"));
+						os.lcd.print(F(" mV")); // 3B => show mV on A0 from hunter P pin
+					}
+				}
+			#endif
+		}
 #endif
 
 		

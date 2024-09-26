@@ -1111,9 +1111,10 @@ function rst_wsp() {document.getElementById('wsp').value='$S';}</script>)"),
 void server_json_controller_main(OTF_PARAMS_DEF) {
 	unsigned char bid, sid;
 	time_os_t curr_time = os.now_tz();
-	bfill.emit_p(PSTR("\"devt\":$L,\"nbrd\":$D,\"en\":$D,\"sn1\":$D,\"sn2\":$D,\"rd\":$D,\"rdst\":$L,"
+	bfill.emit_p(PSTR("\"hunter_p\":$D,\"devt\":$L,\"nbrd\":$D,\"en\":$D,\"sn1\":$D,\"sn2\":$D,\"rd\":$D,\"rdst\":$L," // 3B
 										"\"sunrise\":$D,\"sunset\":$D,\"eip\":$L,\"lwc\":$L,\"lswc\":$L,"
-										"\"lupt\":$L,\"lrbtc\":$D,\"lrun\":[$D,$D,$D,$L],\"pq\":$D,\"pt\":$L,\"nq\":$D,"),
+										"\"lupt\":$L,\"lrbtc\":$D,\"lrun\":[$D,$D,$D,$L],"),
+							os.status.hunter_p, // 3B
 							curr_time,
 							os.nboards,
 							os.status.enabled,
@@ -1131,10 +1132,7 @@ void server_json_controller_main(OTF_PARAMS_DEF) {
 							pd.lastrun.station,
 							pd.lastrun.program,
 							pd.lastrun.duration,
-							pd.lastrun.endtime,
-							os.status.pause_state,
-							os.pause_timer,
-							pd.nqueue);
+							pd.lastrun.endtime);
 
 #if defined(ESP8266)
 	bfill.emit_p(PSTR("\"RSSI\":$D,"), (int16_t)WiFi.RSSI());

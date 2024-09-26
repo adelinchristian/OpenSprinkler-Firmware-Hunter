@@ -937,23 +937,27 @@ void do_loop()
 
 #if defined(ARDUINO)
 		// process LCD display
-		if (!ui_state) {
-			os.lcd_print_screen(ui_anim_chars[(unsigned long)curr_time%3]);
-			#if defined(ESP8266)
-			if(os.get_wifi_mode()==WIFI_MODE_STA && WiFi.status()==WL_CONNECTED && WiFi.localIP()) {
-				os.lcd.setCursor(0, 2);
-				os.lcd.clear(2, 2);
-				if(os.status.program_busy) {
-					//os.lcd.print(F("curr: "));
-          os.lcd.print(F("A0: ")); // 3B => show mV on A0 from hunter P pin
-					uint16_t curr = os.read_current();
-					os.lcd.print(curr);
-					//os.lcd.print(F(" mA"));
-          os.lcd.print(F(" mV")); // 3B => show mV on A0 from hunter P pin
-				}
-			}
-			#endif
-		}
+		if (!ui_state) { os.lcd_print_screen(ui_anim_chars[(unsigned long)curr_time%3]); }
+		
+		//TODO hunter:
+		// if (!ui_state) {
+		// 	os.lcd_print_screen(ui_anim_chars[(unsigned long)curr_time%3]);
+		// 	#if defined(ESP8266)
+		// 	if(os.get_wifi_mode()==WIFI_MODE_STA && WiFi.status()==WL_CONNECTED && WiFi.localIP()) {
+		// 		os.lcd.setCursor(0, 2);
+		// 		os.lcd.clear(2, 2);
+		// 		if(os.status.program_busy) {
+		// 			//os.lcd.print(F("curr: "));
+        //   os.lcd.print(F("A0: ")); // 3B => show mV on A0 from hunter P pin
+		// 			uint16_t curr = os.read_current();
+		// 			os.lcd.print(curr);
+		// 			//os.lcd.print(F(" mA"));
+        //   os.lcd.print(F(" mV")); // 3B => show mV on A0 from hunter P pin
+		// 		}
+		// 	}
+		// }
+#endif
+
 		
 		// check safe_reboot condition
 		if (os.status.safe_reboot && (curr_time > reboot_timer)) {

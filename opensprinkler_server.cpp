@@ -21,42 +21,46 @@
  * <http://www.gnu.org/licenses/>.
  */
 
+#include "types.h"
 #include "OpenSprinkler.h"
 #include "program.h"
 #include "opensprinkler_server.h"
 #include "weather.h"
+#include "mqtt.h"
+#include "main.h"
 
 // External variables defined in main ion file
+#if defined(USE_OTF)
+	extern OTF::OpenThingsFramework *otf;
+	#define OTF_PARAMS_DEF const OTF::Request &req,OTF::Response &res
+	#define OTF_PARAMS req,res
+	#define FKV_SOURCE req
+	#define handle_return(x) {if(x==HTML_OK) res.writeBodyData(ether_buffer, strlen(ether_buffer)); else otf_send_result(req,res,x); return;}
+#else
+	extern EthernetClient *m_client;
+	#define OTF_PARAMS_DEF
+	#define OTF_PARAMS
+	#define FKV_SOURCE p
+	#define handle_return(x) {return_code=x; return;}
+#endif
+
 #if defined(ARDUINO)
-	
 	#if defined(ESP8266)
-
 		#include <FS.h>
+		#include <LittleFS.h>
 		#include "espconnect.h"
-	 
-		extern ESP8266WebServer *wifi_server;
-		extern EthernetServer *m_server;
-		extern EthernetClient *m_client;
-		
-		#define handle_return(x) {if(m_client) {return_code=x; return;} else {if(x==HTML_OK) server_send_html(ether_buffer); else server_send_result(x); return;}}
-
+		extern ESP8266WebServer *update_server;
+		extern ENC28J60lwIP enc28j60;
+		extern Wiznet5500lwIP w5500;
+		extern lwipEth eth;
 	#else
-
 		#include "SdFat.h"
 		extern SdFat sd;
-		extern EthernetClient *m_client;
-		#define handle_return(x) {return_code=x; return;}
 	#endif
-
 #else
-
 	#include <stdarg.h>
 	#include <stdlib.h>
 	#include "etherport.h"
-
-	extern EthernetClient *m_client;
-	#define handle_return(x) {return_code=x; return;}
-
 #endif
 
 extern char ether_buffer[];
@@ -65,22 +69,12 @@ extern OpenSprinkler os;
 extern ProgramData pd;
 extern ulong flow_count;
 
-static byte return_code;
+#if !defined(USE_OTF)
+static unsigned char return_code;
 static char* get_buffer = NULL;
+#endif
 
 BufferFiller bfill;
-
-void schedule_all_stations(ulong curr_time);
-void turn_off_station(byte sid, ulong curr_time);
-void process_dynamic_events(ulong curr_time);
-void check_network(time_t curr_time);
-void check_weather(time_t curr_time);
-void perform_ntp_sync(time_t curr_time);
-void log_statistics(time_t curr_time);
-void delete_log(char *name);
-void reset_all_stations_immediate();
-void reset_all_stations();
-void make_logfile_name(char *name);
 
 /* Check available space (number of bytes) in the Ethernet buffer */
 int available_ether_buffer() {
@@ -88,37 +82,26 @@ int available_ether_buffer() {
 }
 
 // Define return error code
-#define HTML_OK								 0x00
-#define HTML_SUCCESS					 0x01
-#define HTML_UNAUTHORIZED			 0x02
-#define HTML_MISMATCH					 0x03
-#define HTML_DATA_MISSING			 0x10
-#define HTML_DATA_OUTOFBOUND	 0x11
-#define HTML_DATA_FORMATERROR  0x12
-#define HTML_RFCODE_ERROR			 0x13
-#define HTML_PAGE_NOT_FOUND		 0x20
-#define HTML_NOT_PERMITTED		 0x30
-#define HTML_UPLOAD_FAILED		 0x40
-#define HTML_REDIRECT_HOME		 0xFF
+#define HTML_OK               0x00
+#define HTML_SUCCESS          0x01
+#define HTML_UNAUTHORIZED     0x02
+#define HTML_MISMATCH         0x03
+#define HTML_DATA_MISSING     0x10
+#define HTML_DATA_OUTOFBOUND  0x11
+#define HTML_DATA_FORMATERROR 0x12
+#define HTML_RFCODE_ERROR     0x13
+#define HTML_PAGE_NOT_FOUND   0x20
+#define HTML_NOT_PERMITTED    0x30
+#define HTML_UPLOAD_FAILED    0x40
+#define HTML_REDIRECT_HOME    0xFF
 
+#if !defined(USE_OTF)
 static const char html200OK[] PROGMEM =
 	"HTTP/1.1 200 OK\r\n"
 ;
 
-static const char htmlCacheCtrl[] PROGMEM =
-	"Cache-Control: max-age=604800, public\r\n"
-;
-
 static const char htmlNoCache[] PROGMEM =
 	"Cache-Control: max-age=0, no-cache, no-store, must-revalidate\r\n"
-;
-
-static const char htmlContentHTML[] PROGMEM =
-	"Content-Type: text/html\r\n"
-;
-
-static const char htmlAccessControl[] PROGMEM =
-	"Access-Control-Allow-Origin: *\r\n"
 ;
 
 static const char htmlContentJSON[] PROGMEM =
@@ -126,85 +109,48 @@ static const char htmlContentJSON[] PROGMEM =
 	"Connection: close\r\n"
 ;
 
+static const char htmlContentHTML[] PROGMEM =
+	"Content-Type: text/html\r\n"
+	"Connection: close\r\n"
+;
+
+static const char htmlAccessControl[] PROGMEM =
+	"Access-Control-Allow-Origin: *\r\n"
+;
+#endif
+
 static const char htmlMobileHeader[] PROGMEM =
-	"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0,minimum-scale=1.0,user-scalable=no\">\r\n"
+	"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0,minimum-scale=1.0,user-scalable=no\">"
 ;
 
 static const char htmlReturnHome[] PROGMEM =
 	"<script>window.location=\"/\";</script>\n"
 ;
 
-void print_html_standard_header() {
-#if defined(ESP8266)
-	if (m_client) {
-		bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentHTML, htmlNoCache, htmlAccessControl);
-		return;
-	}
-	// else
-	wifi_server->sendHeader("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
-	wifi_server->sendHeader("Access-Control-Allow-Origin", "*");
-#elif defined(ARDUINO)
-	bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentHTML, htmlNoCache, htmlAccessControl);
+#if defined(USE_OTF)
+unsigned char findKeyVal (const OTF::Request &req,char *strbuf, uint16_t maxlen,const char *key,bool key_in_pgm=false,uint8_t *keyfound=NULL) {
+#if defined(ARDUINO)
+	char* result = key_in_pgm ? req.getQueryParameter((const __FlashStringHelper *)key) : req.getQueryParameter(key);
 #else
-	m_client->write((const uint8_t *)html200OK, strlen(html200OK));
-	m_client->write((const uint8_t *)htmlContentHTML, strlen(htmlContentHTML));
-	m_client->write((const uint8_t *)htmlNoCache, strlen(htmlNoCache));
-	m_client->write((const uint8_t *)htmlAccessControl, strlen(htmlAccessControl));
-	m_client->write((const uint8_t *)"\r\n", 2);
+	char* result = req.getQueryParameter(key);
 #endif
-}
-
-void print_json_header(bool bracket=true) {
-#if defined(ESP8266)
-	if (m_client) {
-		bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentJSON, htmlAccessControl, htmlNoCache);
-		if(bracket) bfill.emit_p(PSTR("{"));
-		return;
-	}
-	// else
-	wifi_server->sendHeader("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
-	wifi_server->sendHeader("Content-Type", "application/json");
-	wifi_server->sendHeader("Access-Control-Allow-Origin", "*");
-	if(bracket) bfill.emit_p(PSTR("{"));
-#elif defined(ARDUINO)
-	bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentJSON, htmlAccessControl, htmlNoCache);
-	if(bracket) bfill.emit_p(PSTR("{"));
-#else
-	m_client->write((const uint8_t *)html200OK, strlen(html200OK));
-	m_client->write((const uint8_t *)htmlContentJSON, strlen(htmlContentJSON));
-	m_client->write((const uint8_t *)htmlNoCache, strlen(htmlNoCache));
-	m_client->write((const uint8_t *)htmlAccessControl, strlen(htmlAccessControl));
-	if(bracket) m_client->write((const uint8_t *)"\r\n{", 3);
-	else m_client->write((const uint8_t *)"\r\n", 2);
-#endif
-}
-
-byte findKeyVal (const char *str,char *strbuf, uint16_t maxlen,const char *key,bool key_in_pgm=false,uint8_t *keyfound=NULL) {
-	uint8_t found=0;
-#if defined(ESP8266)
-	// for ESP8266: there are two cases:
-	// case 1: if str is NULL, we assume the key-val to search is already parsed in wifi_server
-	if(str==NULL) {
-		char _key[10];
-		if(key_in_pgm) strcpy_P(_key, key);
-		else strcpy(_key, key);
-		if(wifi_server->hasArg(_key)) {
-			// copy value to buffer, and make sure it ends properly
-			strncpy(strbuf, wifi_server->arg(_key).c_str(), maxlen);
-			strbuf[maxlen-1]=0;
-			found=1;
-		} else {
-			strbuf[0]=0;
-		}
-		if (keyfound) *keyfound = found;
+	if(result!=NULL) {
+		strncpy(strbuf, result, maxlen);
+		strbuf[maxlen-1]=0;
+		if(keyfound) *keyfound=1;
 		return strlen(strbuf);
+	} else {
+		if(keyfound) *keyfound=0;
 	}
+	return 0;
+}
 #endif
-	// case 2: otherwise, assume the key-val is stored in str
+unsigned char findKeyVal (const char *str,char *strbuf, uint16_t maxlen,const char *key,bool key_in_pgm=false,uint8_t *keyfound=NULL) {
+	uint8_t found=0;
 	uint16_t i=0;
 	const char *kp;
+	if(str==NULL||strbuf==NULL||key==NULL) {return 0;}
 	kp=key;
-#if defined(ARDUINO)	
 	if (key_in_pgm) {
 		// key is in program memory space
 		while(*str &&  *str!=' ' && *str!='\n' && found==0){
@@ -222,11 +168,7 @@ byte findKeyVal (const char *str,char *strbuf, uint16_t maxlen,const char *key,b
 			}
 			str++;
 		}
-	}
-	else
-#endif
-	// for Linux, key_in_pgm is always false
-	{
+	}	else {
 		while(*str &&  *str!=' ' && *str!='\n' && found==0){
 			if (*str == *kp){
 				kp++;
@@ -264,145 +206,91 @@ byte findKeyVal (const char *str,char *strbuf, uint16_t maxlen,const char *key,b
 }
 
 void rewind_ether_buffer() {
-	bfill = ether_buffer;
+    bfill = BufferFiller(ether_buffer, ETHER_BUFFER_SIZE*2);
 	ether_buffer[0] = 0;
 }
 
-void send_packet(bool final=false) {
-#if defined(ESP8266)
-	if (m_client) {
-		m_client->write((const uint8_t *)ether_buffer, strlen(ether_buffer));
-		if (final)
-			m_client->stop();
-		else
-			rewind_ether_buffer();
-		return;
-	}
-	// else
-	if(final || available_ether_buffer()<250) {
-		wifi_server->sendContent(ether_buffer);
-		if(final)
-			wifi_server->client().stop();			 
-		else
-			rewind_ether_buffer();
-	}
-#elif defined(ARDUINO)
-	if(final || available_ether_buffer()<250) {
-		m_client->write(ether_buffer, strlen(ether_buffer));
-		if(final)
-			m_client->stop();			 
-		else
-			rewind_ether_buffer();
-	}
+void send_packet(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	res.writeBodyData(ether_buffer, strlen(ether_buffer));
 #else
 	m_client->write((const uint8_t *)ether_buffer, strlen(ether_buffer));
-	if (final)
-		m_client->stop();
-	else
-		rewind_ether_buffer();
-#endif	
+#endif
+	rewind_ether_buffer();
 }
 
-#if defined(ESP8266)
+char dec2hexchar(unsigned char dec) {
+	if(dec<10) return '0'+dec;
+	else return 'A'+(dec-10);
+}
+
+#if defined(USE_OTF)
+void print_header(OTF_PARAMS_DEF, bool isJson=true, int len=0) {
+	res.writeStatus(200, F("OK"));
+	res.writeHeader(F("Content-Type"), isJson?F("application/json"):F("text/html"));
+	if(len>0)
+		res.writeHeader(F("Content-Length"), len);
+	res.writeHeader(F("Access-Control-Allow-Origin"), F("*"));
+	res.writeHeader(F("Cache-Control"), F("max-age=0, no-cache, no-store, must-revalidate"));
+	res.writeHeader(F("Connection"), F("close"));
+}
+#else
+void print_header(bool isJson=true)  {
+	bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, isJson?htmlContentJSON:htmlContentHTML, htmlAccessControl, htmlNoCache);
+}
+#endif
+
+#if defined(USE_OTF)
+#if !defined(ARDUINO)
+string two_digits(uint8_t x) {
+	return std::to_string(x);
+}
+#else
 String two_digits(uint8_t x) {
 	return String(x/10) + (x%10);
 }
+#endif
 
 String toHMS(ulong t) {
 	return two_digits(t/3600)+":"+two_digits((t/60)%60)+":"+two_digits(t%60);
 }
 
-void server_send_html(String html) {
-	if (m_client) {
-		return;
-	}
-	// else
-	wifi_server->send(200, "text/html", html);
+void otf_send_result(OTF_PARAMS_DEF, unsigned char code, const char *item = NULL) {
+	String json = F("{\"result\":");
+#if defined(ARDUINO)
+	json += code;
+#else
+	json += std::to_string(code);
+#endif
+	if (!item) item = "";
+	json += F(",\"item\":\"");
+	json += item;
+	json += F("\"");
+	json += F("}");
+	print_header(OTF_PARAMS, true, json.length());
+	res.writeBodyChunk((char *)"%s",json.c_str());
 }
 
-void server_send_json(String json) {
-	if (m_client) {
-		return;
-	}
-	// else
-	wifi_server->send(200, "application/json", json);
-}
-
-void server_send_result(byte code) {
-	rewind_ether_buffer();
-	String html = F("{\"result\":");
-	html += code;
-	html += "}";
-	print_json_header(false);
-	server_send_json(html);
-}
-
-void server_send_result(byte code, const char* item) {
-	rewind_ether_buffer();
-	String html = F("{\"result\":");
-	html += code;
-	html += F(",\"item\":\"");
-	if(item) html += item;
-	html += "\"";
-	html += "}";
-	print_json_header(false);
-	server_send_json(html);
-}
-
-bool get_value_by_key(const char* key, long& val) {
-	if(wifi_server->hasArg(key)) {
-		val = wifi_server->arg(key).toInt();	 
-		return true;
-	} else {
-		return false;
-	}
-}
-
-bool get_value_by_key(const char* key, String& val) {
-	if(wifi_server->hasArg(key)) {
-		val = wifi_server->arg(key);	 
-		return true;
-	} else {
-		return false;
-	}
-}
-
-void append_key_value(String& html, const char* key, const ulong value) {
-	html += "\"";
-	html += key;
-	html += "\":";
-	html += value;
-	html += ",";
-}
-
-void append_key_value(String& html, const char* key, const int16_t value) {
-	html += "\"";
-	html += key;
-	html += "\":";
-	html += value;
-	html += ",";
-}
-
-void append_key_value(String& html, const char* key, const String& value) {
-	html += "\"";
-	html += key;
-	html += "\":\"";
-	html += value;
-	html += "\",";
-}
-
-char dec2hexchar(byte dec) {
-	if(dec<10) return '0'+dec;
-	else return 'A'+(dec-10);
+#if defined(ESP8266)
+void update_server_send_result(unsigned char code, const char* item = NULL) {
+	String json = F("{\"result\":");
+	json += code;
+	if (!item) item = "";
+	json += F(",\"item\":\"");
+	json += item;
+	json += F("\"");
+	json += F("}");
+	update_server->sendHeader("Access-Control-Allow-Origin", "*"); // from esp8266 2.4 this has to be sent explicitly
+	update_server->send(200, "application/json", json);
 }
 
 String get_ap_ssid() {
 	static String ap_ssid;
 	if(!ap_ssid.length()) {
-		byte mac[6];
+		unsigned char mac[6];
 		WiFi.macAddress(mac);
-		ap_ssid += "OS_";
-		for(byte i=3;i<6;i++) {
+		ap_ssid = "OS_";
+		for(unsigned char i=3;i<6;i++) {
 			ap_ssid += dec2hexchar((mac[i]>>4)&0x0F);
 			ap_ssid += dec2hexchar(mac[i]&0x0F);
 		}
@@ -412,52 +300,81 @@ String get_ap_ssid() {
 
 static String scanned_ssids;
 
-void on_ap_home() {
+void on_ap_home(OTF_PARAMS_DEF) {
 	if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
-	server_send_html(FPSTR(ap_home_html));
+	print_header(OTF_PARAMS, false, strlen_P((char*)ap_home_html));
+	res.writeBodyChunk((char *) "%s", ap_home_html);
 }
 
-void on_ap_scan() {
+void on_ap_scan(OTF_PARAMS_DEF) {
 	if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
-	server_send_html(scanned_ssids);
+	print_header(OTF_PARAMS, true, scanned_ssids.length());
+	res.writeBodyChunk((char *)"%s",scanned_ssids.c_str());
 }
 
-void on_ap_change_config() {
+void on_ap_change_config(OTF_PARAMS_DEF) {
 	if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
-	if(wifi_server->hasArg("ssid")&&wifi_server->arg("ssid").length()!=0) {
-		os.wifi_ssid = wifi_server->arg("ssid");
-		os.wifi_pass = wifi_server->arg("pass"); 
+	char *ssid = req.getQueryParameter("ssid");
+	if(ssid!=NULL&&strlen(ssid)!=0) {
+		os.wifi_ssid = ssid;
+		os.wifi_pass = req.getQueryParameter("pass");
+		char *extra = req.getQueryParameter("extra");
+		if(extra!=NULL) { // bssid and channel are in the format of xx:xx:xx:xx:xx:xx@ch
+			char *mac = strchr(extra, '@'); // search for symbol @
+			if(mac==NULL || !isValidMAC(extra)) { // if not found or if MAC is invalid
+				otf_send_result(OTF_PARAMS, HTML_DATA_FORMATERROR, "bssid");
+				return;
+			}
+			int chl = atoi(mac+1); // convert ch to integer
+			if(!(chl>=0 && chl<=255)) { // chl must be less than 255
+				otf_send_result(OTF_PARAMS, HTML_DATA_OUTOFBOUND, "channel");
+				return;
+			}
+			os.sopt_save(SOPT_STA_BSSID_CHL, extra); // save string to flash first
+			*mac=0; // terminate bssid string
+			str2mac(extra, os.wifi_bssid); // update controller variables
+			os.wifi_channel = chl;
+		} else {
+			os.sopt_save(SOPT_STA_BSSID_CHL, DEFAULT_EMPTY_STRING); // if extra is not present, write empty string
+		}
 		os.sopt_save(SOPT_STA_SSID, os.wifi_ssid.c_str());
 		os.sopt_save(SOPT_STA_PASS, os.wifi_pass.c_str());
-		server_send_result(HTML_SUCCESS);
+		otf_send_result(OTF_PARAMS, HTML_SUCCESS, nullptr);
 		os.state = OS_STATE_TRY_CONNECT;
 		os.lcd.setCursor(0, 2);
 		os.lcd.print(F("Connecting..."));
 	} else {
-		server_send_result(HTML_DATA_MISSING, "ssid");
+		otf_send_result(OTF_PARAMS, HTML_DATA_MISSING, "ssid");
 	}
 }
 
-void on_ap_try_connect() {
-	if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
-	String html = "{";
-	ulong ip = (WiFi.status()==WL_CONNECTED)?(uint32_t)WiFi.localIP():0;
-	append_key_value(html, "ip", ip);
-	html.remove(html.length()-1);  
-	html += "}";
-	server_send_html(html);
-	if(WiFi.status() == WL_CONNECTED && WiFi.localIP()) {
-		// IP received by client, restart
-		//os.reboot_dev(REBOOT_CAUSE_WIFIDONE);
-	}  
-}
+void reboot_in(uint32_t ms);
 
+void on_ap_try_connect(OTF_PARAMS_DEF) {
+	if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
+	String json = "{";
+	json += F("\"ip\":");
+	json += (WiFi.status() == WL_CONNECTED) ? (uint32_t)WiFi.localIP() : 0;
+	json += F("}");
+	print_header(OTF_PARAMS,true,json.length());
+	res.writeBodyChunk((char *)"%s",json.c_str());
+	if(WiFi.status() == WL_CONNECTED && WiFi.localIP()) {
+		os.iopts[IOPT_WIFI_MODE] = WIFI_MODE_STA;
+		os.iopts_save();
+		DEBUG_PRINTLN(F("IP received by client, restart."));
+		reboot_in(1000);
+	}
+}
+#endif
 #endif
 
 
 /** Check and verify password */
-#if defined(ESP8266)
-boolean process_password(boolean fwv_on_fail=false, char *p = NULL)
+#if defined(USE_OTF)
+boolean check_password(char *p) {
+	return true;
+}
+boolean process_password(OTF_PARAMS_DEF, boolean fwv_on_fail=false)
 #else
 boolean check_password(char *p)
 #endif
@@ -466,33 +383,39 @@ boolean check_password(char *p)
 	return true;
 #endif
 	if (os.iopts[IOPT_IGNORE_PASSWORD])  return true;
+
+#if !defined(USE_OTF)
 	if (m_client && !p) {
 		p = get_buffer;
-	}  
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pw"), true)) {
-		urlDecode(tmp_buffer);
-		if (os.password_verify(tmp_buffer))
-			return true;
 	}
-#if defined(ESP8266)
-	if(m_client) { return false; }
-	/* some pages will output fwv if password check has failed */
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pw"), true)) {
+		urlDecode(tmp_buffer);
+		if (os.password_verify(tmp_buffer)) return true;
+	}
+#else
+	/*if(req.isCloudRequest()){ // password is not required if this is coming from cloud connection
+		return true;
+	}*/
+	const char *pw = req.getQueryParameter("pw");
+	if(pw != NULL && os.password_verify(pw)) return true;
+
+	/* if fwv_on_fail is true, output fwv if password check has failed */
 	if(fwv_on_fail) {
 		rewind_ether_buffer();
-		print_json_header();
-		bfill.emit_p(PSTR("\"$F\":$D}"), iopt_json_names+0, os.iopts[0]);
-		server_send_html(ether_buffer);
+		bfill.emit_p(PSTR("{\"$F\":$D}"), iopt_json_names+0, os.iopts[0]);
+		print_header(OTF_PARAMS,true,strlen(ether_buffer));
+		res.writeBodyChunk((char *)"%s",ether_buffer);
 	} else {
-		server_send_result(HTML_UNAUTHORIZED);
+		otf_send_result(OTF_PARAMS, HTML_UNAUTHORIZED);
 	}
 #endif
 	return false;
 }
 
-void server_json_stations_attrib(const char* name, byte *attrib)
+void server_json_board_attrib(const char* name, unsigned char *attrib)
 {
 	bfill.emit_p(PSTR("\"$F\":["), name);
-	for(byte i=0;i<os.nboards;i++) {
+	for(unsigned char i=0;i<os.nboards;i++) {
 		bfill.emit_p(PSTR("$D"), attrib[i]);
 		if(i!=os.nboards-1)
 			bfill.emit_p(PSTR(","));
@@ -500,75 +423,123 @@ void server_json_stations_attrib(const char* name, byte *attrib)
 	bfill.emit_p(PSTR("],"));
 }
 
-void server_json_stations_main() {
-	server_json_stations_attrib(PSTR("masop"), os.attrib_mas);
-	server_json_stations_attrib(PSTR("masop2"), os.attrib_mas2);
-	server_json_stations_attrib(PSTR("ignore_rain"), os.attrib_igrd);  
-	server_json_stations_attrib(PSTR("ignore_sn1"), os.attrib_igs);
-	server_json_stations_attrib(PSTR("ignore_sn2"), os.attrib_igs2);
-	server_json_stations_attrib(PSTR("stn_dis"), os.attrib_dis);
-	server_json_stations_attrib(PSTR("stn_seq"), os.attrib_seq);
-	server_json_stations_attrib(PSTR("stn_spe"), os.attrib_spe);
+void server_json_stations_attrib(const char* name, unsigned char *attrib)
+{
+	bfill.emit_p(PSTR("\"$F\":["), name);
+	for(unsigned char bid=0;bid<os.nboards;bid++) {
+		for (unsigned char s = 0; s < 8; s++) {
+			bfill.emit_p(PSTR("$D"), attrib[bid * 8 + s]);
+			if(bid != os.nboards-1 || s < 7) {
+				bfill.emit_p(PSTR(","));
+			}
+		}
+	}
+	bfill.emit_p(PSTR("],"));
+}
+
+void server_json_stations_main(OTF_PARAMS_DEF) {
+	server_json_board_attrib(PSTR("masop"), os.attrib_mas);
+	server_json_board_attrib(PSTR("masop2"), os.attrib_mas2);
+	server_json_board_attrib(PSTR("ignore_rain"), os.attrib_igrd);
+	server_json_board_attrib(PSTR("ignore_sn1"), os.attrib_igs);
+	server_json_board_attrib(PSTR("ignore_sn2"), os.attrib_igs2);
+	server_json_board_attrib(PSTR("stn_dis"), os.attrib_dis);
+	server_json_board_attrib(PSTR("stn_spe"), os.attrib_spe);
+	server_json_stations_attrib(PSTR("stn_grp"), os.attrib_grp);
 
 	bfill.emit_p(PSTR("\"snames\":["));
-	byte sid;
+	unsigned char sid;
 	for(sid=0;sid<os.nstations;sid++) {
 		os.get_station_name(sid, tmp_buffer);
 		bfill.emit_p(PSTR("\"$S\""), tmp_buffer);
 		if(sid!=os.nstations-1)
 			bfill.emit_p(PSTR(","));
-		if (available_ether_buffer() < 60) {
-			send_packet();
+		if (available_ether_buffer() <=0 ) {
+			send_packet(OTF_PARAMS);
 		}
 	}
 	bfill.emit_p(PSTR("],\"maxlen\":$D}"), STATION_NAME_SIZE);
 }
 
 /** Output stations data */
-void server_json_stations() {
-#if defined(ESP8266)
-	if(!process_password()) return;
+void server_json_stations(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
 #endif
-	print_json_header();
-	server_json_stations_main();
+
+	bfill.emit_p(PSTR("{"));
+	server_json_stations_main(OTF_PARAMS);
 	handle_return(HTML_OK);
 }
 
 /** Output station special attribute */
-void server_json_station_special() {
-
-#if defined(ESP8266)
-	if(!process_password()) return;
+void server_json_station_special(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
 #endif
 
-	byte sid;
-	byte comma=0;
+	unsigned char sid;
+	unsigned char comma=0;
 	StationData *data = (StationData*)tmp_buffer;
-	print_json_header();
+
+	bfill.emit_p(PSTR("{"));
 	for(sid=0;sid<os.nstations;sid++) {
-		if(os.get_station_type(sid)!=STN_TYPE_STANDARD) {  // check if this is a special station
+		unsigned char bid=sid>>3,s=sid&0x07;
+		if(os.attrib_spe[bid]&(1<<s)) { // check if this is a special station
 			os.get_station_data(sid, data);
 			if (comma) bfill.emit_p(PSTR(","));
 			else {comma=1;}
 			bfill.emit_p(PSTR("\"$D\":{\"st\":$D,\"sd\":\"$S\"}"), sid, data->type, data->sped);
+		}
+		if (available_ether_buffer() <=0 ) {
+			send_packet(OTF_PARAMS);
 		}
 	}
 	bfill.emit_p(PSTR("}"));
 	handle_return(HTML_OK);
 }
 
-
-void server_change_stations_attrib(char *p, char header, byte *attrib)
+#if defined(USE_OTF)
+void server_change_board_attrib(const OTF::Request &req, char header, unsigned char *attrib)
+#else
+void server_change_board_attrib(char *p, char header, unsigned char *attrib)
+#endif
 {
-	char tbuf2[3] = {0, 0, 0};
-	byte bid;
+	char tbuf2[5] = {0, 0, 0, 0, 0};
+	unsigned char bid;
 	tbuf2[0]=header;
 	for(bid=0;bid<os.nboards;bid++) {
-		itoa(bid, tbuf2+1, 10);
-		if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
+		snprintf(tbuf2+1, 3, "%d", bid);
+		if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
 			attrib[bid] = atoi(tmp_buffer);
+		}
+	}
+}
+
+#if defined(USE_OTF)
+void server_change_stations_attrib(const OTF::Request &req, char header, unsigned char *attrib)
+#else
+void server_change_stations_attrib(char *p, char header, unsigned char *attrib)
+#endif
+{
+	char tbuf2[6] = {0, 0, 0, 0, 0, 0};
+	unsigned char bid, s, sid;
+	tbuf2[0]=header;
+	for(bid=0;bid<os.nboards;bid++) {
+		for(s=0;s<8;s++) {
+			sid=bid*8+s;
+			snprintf(tbuf2+1, 3, "%d", sid);
+			if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
+				attrib[sid] = atoi(tmp_buffer);
+			}
 		}
 	}
 }
@@ -582,65 +553,62 @@ void server_change_stations_attrib(char *p, char header, byte *attrib)
  * i?: ignore rain bit field
  * n?: master2 operation bit field
  * d?: disable sation bit field
- * q?: station sequeitnal bit field
+ * q?: station sequential bit field
  * p?: station special flag bit field
+ * g?: sequential group id
  */
-void server_change_stations() {
-#if defined(ESP8266)
-	char* p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+void server_change_stations(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char* p = get_buffer;
 #endif
-	
-	byte sid;
-	char tbuf2[4] = {'s', 0, 0, 0};
+
+	unsigned char sid;
+	char tbuf2[5] = {'s', 0, 0, 0, 0};
 	// process station names
 	for(sid=0;sid<os.nstations;sid++) {
-		itoa(sid, tbuf2+1, 10);
-		if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
+		snprintf(tbuf2+1, 3, "%d", sid);
+		if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
 			urlDecode(tmp_buffer);
+			strReplace(tmp_buffer, '\"', '\'');
+			strReplace(tmp_buffer, '\\', '/');
 			os.set_station_name(sid, tmp_buffer);
 		}
 	}
 
-	server_change_stations_attrib(p, 'm', os.attrib_mas); // master1
-	server_change_stations_attrib(p, 'i', os.attrib_igrd); // ignore rain delay
-	server_change_stations_attrib(p, 'j', os.attrib_igs); // ignore sensor1
-	server_change_stations_attrib(p, 'k', os.attrib_igs2); // ignore sensor2
-	server_change_stations_attrib(p, 'n', os.attrib_mas2); // master2
-	server_change_stations_attrib(p, 'd', os.attrib_dis); // disable
-	server_change_stations_attrib(p, 'q', os.attrib_seq); // sequential
-	server_change_stations_attrib(p, 'p', os.attrib_spe); // special
-
+	server_change_board_attrib(FKV_SOURCE, 'm', os.attrib_mas); // master1
+	server_change_board_attrib(FKV_SOURCE, 'i', os.attrib_igrd); // ignore rain delay
+	server_change_board_attrib(FKV_SOURCE, 'j', os.attrib_igs); // ignore sensor1
+	server_change_board_attrib(FKV_SOURCE, 'k', os.attrib_igs2); // ignore sensor2
+	server_change_board_attrib(FKV_SOURCE, 'n', os.attrib_mas2); // master2
+	server_change_board_attrib(FKV_SOURCE, 'd', os.attrib_dis); // disable
+	server_change_stations_attrib(FKV_SOURCE, 'g', os.attrib_grp); // sequential groups
 	/* handle special data */
-	if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
+	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
 		sid = atoi(tmp_buffer);
 		if(sid<0 || sid>os.nstations) handle_return(HTML_DATA_OUTOFBOUND);
-		if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("st"), true) &&
-			 findKeyVal(p, tmp_buffer+1, TMP_BUFFER_SIZE-1, PSTR("sd"), true)) {
+		if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("st"), true) &&
+			 findKeyVal(FKV_SOURCE, tmp_buffer+1, TMP_BUFFER_SIZE-1, PSTR("sd"), true)) {
 
 			tmp_buffer[0]-='0';
 			tmp_buffer[STATION_SPECIAL_DATA_SIZE] = 0;
 
-			// only process GPIO and HTTP stations for OS 2.3, above, and OSPi
 			if(tmp_buffer[0] == STN_TYPE_GPIO) {
 				// check that pin does not clash with OSPi pins
-				byte gpio = (tmp_buffer[1] - '0') * 10 + tmp_buffer[2] - '0';
-				byte activeState = tmp_buffer[3] - '0';
+				unsigned char gpio = (tmp_buffer[1] - '0') * 10 + tmp_buffer[2] - '0';
+				unsigned char activeState = tmp_buffer[3] - '0';
 
-				byte gpioList[] = PIN_FREE_LIST;
+				unsigned char gpioList[] = PIN_FREE_LIST;
 				bool found = false;
-				for (byte i = 0; i < sizeof(gpioList) && found == false; i++) {
+				for (unsigned char i = 0; i < sizeof(gpioList) && found == false; i++) {
 					if (gpioList[i] == gpio) found = true;
 				}
-				if (!found || activeState > 1) handle_return(HTML_DATA_OUTOFBOUND);
-			} else if (tmp_buffer[0] == STN_TYPE_HTTP) {
-				#if defined(ESP8266)	// ESP8266 performs automatic decoding so no need to do it again
-					if(m_server) urlDecode(tmp_buffer + 1);
-				#else
+				if (!found || activeState > 1) {
+					handle_return(HTML_DATA_OUTOFBOUND);
+				}
+			} else if ((tmp_buffer[0] == STN_TYPE_HTTP) || (tmp_buffer[0] == STN_TYPE_HTTPS) || (tmp_buffer[0] == STN_TYPE_REMOTE_OTC)) {
+				#if !defined(ESP8266) // ESP8266 does automatic decoding
 					urlDecode(tmp_buffer + 1);
 				#endif
 				if (strlen(tmp_buffer+1) > sizeof(HTTPStationData)) {
@@ -657,9 +625,10 @@ void server_change_stations() {
 
 		}
 	}
+	// handle special attribute after parameters have been processed
+	server_change_board_attrib(FKV_SOURCE, 'p', os.attrib_spe);
 
 	os.attribs_save();
-	
 	handle_return(HTML_SUCCESS);
 }
 
@@ -680,7 +649,7 @@ uint16_t parse_listdata(char **p) {
 	return (uint16_t)atol(tmp_buffer);
 }
 
-void manual_start_program(byte, byte);
+void manual_start_program(unsigned char, unsigned char);
 /** Manual start program
  * Command: /mp?pw=xxx&pid=xxx&uwt=xxx
  *
@@ -688,17 +657,14 @@ void manual_start_program(byte, byte);
  * pid: program index (0 refers to the first program)
  * uwt: use weather (i.e. watering percentage)
  */
-void server_manual_program() {
-#if defined(ESP8266)
-	char* p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;
+void server_manual_program(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
 #endif
 
-	if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
 		handle_return(HTML_DATA_MISSING);
 
 	int pid=atoi(tmp_buffer);
@@ -706,8 +672,8 @@ void server_manual_program() {
 		handle_return(HTML_DATA_OUTOFBOUND);
 	}
 
-	byte uwt = 0;
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uwt"), true)) {
+	unsigned char uwt = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uwt"), true)) {
 		if(tmp_buffer[0]=='1') uwt = 1;
 	}
 
@@ -726,17 +692,14 @@ void server_manual_program() {
  * pw: password
  * t:  station water time
  */
-void server_change_runonce() {
-#if defined(ESP8266)
-	char* p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;
-	if(!findKeyVal(p,tmp_buffer,TMP_BUFFER_SIZE, "t", false)) handle_return(HTML_DATA_MISSING);
+void server_change_runonce(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
+	if(!findKeyVal(FKV_SOURCE,tmp_buffer,TMP_BUFFER_SIZE, "t", false)) handle_return(HTML_DATA_MISSING);
 	char *pv = tmp_buffer+1;
 #else
 	char *p = get_buffer;
-	
+
 	// decode url first
 	if(p) urlDecode(p);
 	// search for the start of t=[
@@ -755,7 +718,7 @@ void server_change_runonce() {
 	// reset all stations and prepare to run one-time program
 	reset_all_stations_immediate();
 
-	byte sid, bid, s;
+	unsigned char sid, bid, s;
 	uint16_t dur;
 	boolean match_found = false;
 	for(sid=0;sid<os.nstations;sid++) {
@@ -791,16 +754,13 @@ void server_change_runonce() {
  * pw: password
  * pid:program index (-1 will delete all programs)
  */
-void server_delete_program() {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+void server_delete_program(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
 #endif
-	if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
 		handle_return(HTML_DATA_MISSING);
 
 	int pid=atoi(tmp_buffer);
@@ -822,19 +782,16 @@ void server_delete_program() {
  * pw:	password
  * pid: program index (must be 1 or larger, because we can't move up program 0)
 */
-void server_moveup_program() {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+void server_moveup_program(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
 #endif
 
-	if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
 		handle_return(HTML_DATA_MISSING);
-		
+
 	int pid=atoi(tmp_buffer);
 	if (!(pid>=1 && pid< pd.nprograms))
 		handle_return(HTML_DATA_OUTOFBOUND);
@@ -846,7 +803,8 @@ void server_moveup_program() {
 
 /**
  * Change a program
- * Command: /cp?pw=xxx&pid=x&v=[flag,days0,days1,[start0,start1,start2,start3],[dur0,dur1,dur2..]]&name=x
+ * Command: /cp?pw=xxx&pid=x&v=[flag,days0,days1,[start0,start1,start2,start3],[dur0,dur1,dur2..]]
+ *              &name=x&from=x&to=x
  *
  * pw:		password
  * pid:		program index
@@ -854,57 +812,76 @@ void server_moveup_program() {
  * start?:up to 4 start times
  * dur?:	station water time
  * name:	program name
+ * from:  start date of the program: an integer that's (month*32+day)
+ * to:    end date of the program, same format as from
 */
 const char _str_program[] PROGMEM = "Program ";
-void server_change_program() {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;
+void server_change_program(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
 #endif
 
-	byte i;
+	unsigned char i;
 
 	ProgramStruct prog;
 
 	// parse program index
-	if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true)) handle_return(HTML_DATA_MISSING);
-	
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true)) handle_return(HTML_DATA_MISSING);
+
 	int pid=atoi(tmp_buffer);
 	if (!(pid>=-1 && pid< pd.nprograms)) handle_return(HTML_DATA_OUTOFBOUND);
 
 	// check if "en" parameter is present
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
 		if(pid<0) handle_return(HTML_DATA_OUTOFBOUND);
 		pd.set_flagbit(pid, PROGRAMSTRUCT_EN_BIT, (tmp_buffer[0]=='0')?0:1);
 		handle_return(HTML_SUCCESS);
 	}
 
 	// check if "uwt" parameter is present
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uwt"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uwt"), true)) {
 		if(pid<0) handle_return(HTML_DATA_OUTOFBOUND);
 		pd.set_flagbit(pid, PROGRAMSTRUCT_UWT_BIT, (tmp_buffer[0]=='0')?0:1);
 		handle_return(HTML_SUCCESS);
 	}
-	
+
 	// parse program name
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("name"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("name"), true)) {
 		urlDecode(tmp_buffer);
+		strReplace(tmp_buffer, '\"', '\'');
+		strReplace(tmp_buffer, '\\', '/');
 		strncpy(prog.name, tmp_buffer, PROGRAM_NAME_SIZE);
 	} else {
 		strcpy_P(prog.name, _str_program);
-		itoa((pid==-1)? (pd.nprograms+1): (pid+1), prog.name+8, 10);
+		snprintf(prog.name+8, PROGRAM_NAME_SIZE - 8, "%d", (pid==-1)? (pd.nprograms+1): (pid+1));
 	}
 
-	// do a full string decoding
-	if(p) urlDecode(p);
+	// parse program start date and end date
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("from"), true)) {
+		int16_t date = atoi(tmp_buffer);
+		if(!isValidDate(date)) handle_return(HTML_DATA_OUTOFBOUND);
+		prog.daterange[0] = date;
+		if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("to"), true)) {
+			date = atoi(tmp_buffer);
+			if(!isValidDate(date)) handle_return(HTML_DATA_OUTOFBOUND);
+			prog.daterange[1] = date;
+		} else {
+			handle_return(HTML_DATA_MISSING);
+		}
+	}
 
-#if defined(ESP8266)
-	if(!findKeyVal(p,tmp_buffer,TMP_BUFFER_SIZE, "v",false)) handle_return(HTML_DATA_MISSING);
-	char *pv = tmp_buffer+1;	
+
+#if !defined(USE_OTF)
+	if(p) urlDecode(p);
+#endif
+
+
+#if defined(USE_OTF)
+	if(!findKeyVal(FKV_SOURCE,tmp_buffer,TMP_BUFFER_SIZE, "v",false)) handle_return(HTML_DATA_MISSING);
+	char *pv = tmp_buffer+1;
+	// TODO: may need a urlDecode for non-ESP platforms
 #else
 	// parse ad-hoc v=[...
 	// search for the start of v=[
@@ -921,11 +898,20 @@ void server_change_program() {
 	if(!found)	handle_return(HTML_DATA_MISSING);
 	pv+=3;
 #endif
-	
+
 	// parse headers
 	*(char*)(&prog) = parse_listdata(&pv);
 	prog.days[0]= parse_listdata(&pv);
 	prog.days[1]= parse_listdata(&pv);
+	
+	if (prog.type == PROGRAM_TYPE_INTERVAL) {
+		if (prog.days[1] == 0) handle_return(HTML_DATA_OUTOFBOUND)
+		else if (prog.days[1] >= 1) {
+			// process interval day remainder (relative-> absolute)
+			pd.drem_to_absolute(prog.days);
+		}
+	}
+
 	// parse start times
 	pv++; // this should be a '['
 	for (i=0;i<MAX_NUM_STARTTIMES;i++) {
@@ -946,11 +932,6 @@ void server_change_program() {
 		prog.durations[i] = 0;		 // clear unused field
 	}
 
-	// process interval day remainder (relative-> absolute)
-	if (prog.type == PROGRAM_TYPE_INTERVAL && prog.days[1] > 1) {
-		pd.drem_to_absolute(prog.days);
-	}
-
 	if (pid==-1) {
 		if(!pd.add(&prog)) handle_return(HTML_DATA_OUTOFBOUND);
 	} else {
@@ -960,30 +941,31 @@ void server_change_program() {
 }
 
 void server_json_options_main() {
-	byte oid;
+	unsigned char oid;
 	for(oid=0;oid<NUM_IOPTS;oid++) {
 		#if !defined(ARDUINO) // do not send the following parameters for non-Arduino platforms
 		if (oid==IOPT_USE_NTP			|| oid==IOPT_USE_DHCP		 ||
 				(oid>=IOPT_STATIC_IP1	&& oid<=IOPT_STATIC_IP4) ||
 				(oid>=IOPT_GATEWAY_IP1 && oid<=IOPT_GATEWAY_IP4) ||
 				(oid>=IOPT_DNS_IP1 && oid<=IOPT_DNS_IP4) ||
-				(oid>=IOPT_SUBNET_MASK1 && oid<=IOPT_SUBNET_MASK4))
+				(oid>=IOPT_SUBNET_MASK1 && oid<=IOPT_SUBNET_MASK4) ||
+				(oid==IOPT_FORCE_WIRED))
 				continue;
 		#endif
-		
-		#if !defined(ESP8266)
-		// so far only OS3.x has sensor2
+
+		#if !(defined(ESP8266) || defined(PIN_SENSOR2))
+		// only OS 3.x or controllers that have PIN_SENSOR2 defined support sensor 2 options
 		if (oid==IOPT_SENSOR2_TYPE || oid==IOPT_SENSOR2_OPTION || oid==IOPT_SENSOR2_ON_DELAY || oid==IOPT_SENSOR2_OFF_DELAY)
 			continue;
 		#endif
-		
+
 		int32_t v=os.iopts[oid];
 		if (oid==IOPT_MASTER_OFF_ADJ || oid==IOPT_MASTER_OFF_ADJ_2 ||
 				oid==IOPT_MASTER_ON_ADJ  || oid==IOPT_MASTER_ON_ADJ_2 ||
 				oid==IOPT_STATION_DELAY_TIME) {
 			v=water_time_decode_signed(v);
 		}
-		
+
 		#if defined(ARDUINO)
 		if (oid==IOPT_BOOST_TIME) {
 			if (os.hw_type==HW_TYPE_AC || os.hw_type==HW_TYPE_UNKNOWN) continue;
@@ -992,19 +974,19 @@ void server_json_options_main() {
 		#else
 		if (oid==IOPT_BOOST_TIME) continue;
 		#endif
-		
+
 		#if defined(ESP8266)
 		if (oid==IOPT_HW_VERSION) {
 			v+=os.hw_rev;	// for OS3.x, add hardware revision number
 		}
 		#endif
-		
+
 		if (oid==IOPT_SEQUENTIAL_RETIRED || oid==IOPT_URS_RETIRED || oid==IOPT_RSO_RETIRED) continue;
-	 
+
 #if defined(ARDUINO)
 		#if defined(ESP8266)
-		// for SSD1306, no LCD parameters
-		if(oid==IOPT_LCD_CONTRAST || oid==IOPT_LCD_BACKLIGHT || oid==IOPT_LCD_DIMMING) continue;
+		// for SSD1306, we can't adjust contrast or backlight
+		if(oid==IOPT_LCD_CONTRAST || oid==IOPT_LCD_BACKLIGHT) continue;
 		#else
 		if (os.lcd.type() == LCD_I2C) {
 			// for I2C type LCD, we can't adjust contrast or backlight
@@ -1023,33 +1005,45 @@ void server_json_options_main() {
 			bfill.emit_p(PSTR(","));
 	}
 
-	bfill.emit_p(PSTR(",\"dexp\":$D,\"mexp\":$D,\"hwt\":$D}"), os.detect_exp(), MAX_EXT_BOARDS, os.hw_type);
+	bfill.emit_p(PSTR(",\"dexp\":$D,\"mexp\":$D,\"hwt\":$D,"), os.detect_exp(), MAX_EXT_BOARDS, os.hw_type);
+	// print master array
+	unsigned char masid, optidx;
+	bfill.emit_p(PSTR("\"ms\":["));
+	for (masid = 0; masid < NUM_MASTER_ZONES; masid++) {
+		for (optidx = 0; optidx < NUM_MASTER_OPTS; optidx++) {
+			bfill.emit_p(PSTR("$D"), os.masters[masid][optidx]);
+			bfill.emit_p((masid == NUM_MASTER_ZONES - 1 && optidx == NUM_MASTER_OPTS - 1) ? PSTR("]}") : PSTR(","));
+		}
+	}
 }
 
 /** Output Options */
-void server_json_options() {
-#if defined(ESP8266)
-	if(!process_password(true)) return;
+void server_json_options(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS,true)) return;
 	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
 #endif
-	print_json_header();
+	bfill.emit_p(PSTR("{"));
 	server_json_options_main();
 	handle_return(HTML_OK);
 }
 
-void server_json_programs_main() {
+void server_json_programs_main(OTF_PARAMS_DEF) {
 
 	bfill.emit_p(PSTR("\"nprogs\":$D,\"nboards\":$D,\"mnp\":$D,\"mnst\":$D,\"pnsize\":$D,\"pd\":["),
 							 pd.nprograms, os.nboards, MAX_NUM_PROGRAMS, MAX_NUM_STARTTIMES, PROGRAM_NAME_SIZE);
-	byte pid, i;
+	unsigned char pid, i;
 	ProgramStruct prog;
 	for(pid=0;pid<pd.nprograms;pid++) {
 		pd.read(pid, &prog);
-		if (prog.type == PROGRAM_TYPE_INTERVAL && prog.days[1] > 1) {
+		if (prog.type == PROGRAM_TYPE_INTERVAL && prog.days[1] >= 1) {
 			pd.drem_to_relative(prog.days);
 		}
 
-		byte bytedata = *(char*)(&prog);
+		unsigned char bytedata = *(char*)(&prog);
 		bfill.emit_p(PSTR("[$D,$D,$D,["), bytedata, prog.days[0], prog.days[1]);
 		// start times data
 		for (i=0;i<(MAX_NUM_STARTTIMES-1);i++) {
@@ -1064,52 +1058,62 @@ void server_json_programs_main() {
 		// program name
 		strncpy(tmp_buffer, prog.name, PROGRAM_NAME_SIZE);
 		tmp_buffer[PROGRAM_NAME_SIZE] = 0;	// make sure the string ends
-		bfill.emit_p(PSTR("$S"), tmp_buffer);
+		bfill.emit_p(PSTR("$S\",[$D,$D,$D]]"), tmp_buffer,prog.en_daterange,prog.daterange[0],prog.daterange[1]);
 		if(pid!=pd.nprograms-1) {
-			bfill.emit_p(PSTR("\"],"));
-		} else {
-			bfill.emit_p(PSTR("\"]"));
+			bfill.emit_p(PSTR(","));
 		}
 		// push out a packet if available
 		// buffer size is getting small
-		if (available_ether_buffer() < 250) {
-			send_packet();
+		if (available_ether_buffer() <= 0) {
+			send_packet(OTF_PARAMS);
 		}
 	}
 	bfill.emit_p(PSTR("]}"));
 }
 
 /** Output program data */
-void server_json_programs() {
-#if defined(ESP8266)
-	if(!process_password()) return;
+void server_json_programs(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
 #endif
-
-	print_json_header();
-	server_json_programs_main();
+	bfill.emit_p(PSTR("{"));
+	server_json_programs_main(OTF_PARAMS);
 	handle_return(HTML_OK);
 }
 
 /** Output script url form */
-void server_view_scripturl() {
-#if defined(ESP8266)
-	// no authenticaion needed
+void server_view_scripturl(OTF_PARAMS_DEF) {
 	rewind_ether_buffer();
+#if defined(USE_OTF)
+	print_header(OTF_PARAMS,false,strlen(ether_buffer));
+#else
+	print_header(false);
 #endif
-
-	print_html_standard_header();
-	bfill.emit_p(PSTR("<form name=of action=cu method=get><table cellspacing=\"12\"><tr><td><b>JavaScript</b>:</td><td><input type=text size=40 maxlength=40 value=\"$O\" name=jsp></td></tr><tr><td>Default:</td><td>$S</td></tr><tr><td><b>Weather</b>:</td><td><input type=text size=40 maxlength=40 value=\"$O\" name=wsp></td></tr><tr><td>Default:</td><td>$S</td></tr><tr><td><b>Password</b>:</td><td><input type=password size=32 name=pw> <input type=submit></td></tr></table></form><script src=https://ui.opensprinkler.com/js/hasher.js></script>"), SOPT_JAVASCRIPTURL, DEFAULT_JAVASCRIPT_URL, SOPT_WEATHERURL, DEFAULT_WEATHER_URL);
+	//bfill.emit_p(PSTR("<form name=of action=cu method=get><table cellspacing=12><tr><td><b>JavaScript</b>:</td><td><input type=text size=40 maxlength=$D value='$O' name=jsp></td></tr><tr><td>Default:</td><td>$S</td></tr><tr><td><b>Weather</b>:</td><td><input type=text size=40 maxlength=$D value='$O' name=wsp></td></tr><tr><td>Default:</td><td>$S</td></tr><tr><td><b>Password</b>:</td><td><input type=password size=32 name=pw> <input type=submit value=Submit></td></tr></table></form><script src=https://ui.opensprinkler.com/js/hasher.js></script>"),
+	bfill.emit_p(PSTR(R"(<form name=of action=cu method=get><table cellspacing=12>
+<tr><td><b>UI Source</b>:</td><td><input type=text size=40 maxlength=$D value='$O' id=jsp name=jsp></td></tr>
+<tr><td></td><td><button type=button onclick='rst_jsp()'>Reset UI Source</button></td></tr>
+<tr><td><b>Weather</b>:</td><td><input type=text size=40 maxlength=$D value='$O' id=wsp name=wsp></td></tr>
+<tr><td></td><td><button type=button onclick='rst_wsp()'>Reset Weather Server</button></td></tr>
+<tr><td><b>Password</b>:</td><td><input type=password size=32 name=pw><input type=submit value=submit></tr>
+</table></form>
+<script src=https://ui.opensprinkler.com/js/hasher.js></script>
+<script>function rst_jsp() {document.getElementById('jsp').value='$S';}
+function rst_wsp() {document.getElementById('wsp').value='$S';}</script>)"),
+	MAX_SOPTS_SIZE, SOPT_JAVASCRIPTURL, MAX_SOPTS_SIZE, SOPT_WEATHERURL, DEFAULT_JAVASCRIPT_URL, DEFAULT_WEATHER_URL);
 	handle_return(HTML_OK);
 }
 
-void server_json_controller_main() {
-	byte bid, sid;
-	ulong curr_time = os.now_tz();
-	bfill.emit_p(PSTR("\"hunter_p\":$D,\"devt\":$L,\"nbrd\":$D,\"en\":$D,\"sn1\":$D,\"sn2\":$D,\"rd\":$D,\"rdst\":$L," // 3B
+void server_json_controller_main(OTF_PARAMS_DEF) {
+	unsigned char bid, sid;
+	time_os_t curr_time = os.now_tz();
+	bfill.emit_p(PSTR("\"devt\":$L,\"nbrd\":$D,\"en\":$D,\"sn1\":$D,\"sn2\":$D,\"rd\":$D,\"rdst\":$L,"
 										"\"sunrise\":$D,\"sunset\":$D,\"eip\":$L,\"lwc\":$L,\"lswc\":$L,"
-										"\"lupt\":$L,\"lrbtc\":$D,\"lrun\":[$D,$D,$D,$L],"),
-							os.status.hunter_p, // 3B
+										"\"lupt\":$L,\"lrbtc\":$D,\"lrun\":[$D,$D,$D,$L],\"pq\":$D,\"pt\":$L,\"nq\":$D,"),
 							curr_time,
 							os.nboards,
 							os.status.enabled,
@@ -1127,20 +1131,42 @@ void server_json_controller_main() {
 							pd.lastrun.station,
 							pd.lastrun.program,
 							pd.lastrun.duration,
-							pd.lastrun.endtime);
+							pd.lastrun.endtime,
+							os.status.pause_state,
+							os.pause_timer,
+							pd.nqueue);
 
 #if defined(ESP8266)
 	bfill.emit_p(PSTR("\"RSSI\":$D,"), (int16_t)WiFi.RSSI());
 #endif
 
-	bfill.emit_p(PSTR("\"loc\":\"$O\",\"jsp\":\"$O\",\"wsp\":\"$O\",\"wto\":{$O},\"ifkey\":\"$O\",\"wtdata\":$S,\"wterr\":$D,"),
+#if defined(USE_OTF)
+	bfill.emit_p(PSTR("\"otc\":{$O},\"otcs\":$D,"), SOPT_OTC_OPTS, otf->getCloudStatus());
+#endif
+
+	unsigned char mac[6] = {0};
+#if defined(ARDUINO)
+	os.load_hardware_mac(mac, useEth);
+#else
+	os.load_hardware_mac(mac, true);
+#endif
+
+	bfill.emit_p(PSTR("\"mac\":\"$X:$X:$X:$X:$X:$X\","), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+	bfill.emit_p(PSTR("\"loc\":\"$O\",\"jsp\":\"$O\",\"wsp\":\"$O\",\"wto\":{$O},\"ifkey\":\"$O\",\"mqtt\":{$O},\"wtdata\":$S,\"wterr\":$D,\"dname\":\"$O\","),
 							 SOPT_LOCATION,
 							 SOPT_JAVASCRIPTURL,
 							 SOPT_WEATHERURL,
 							 SOPT_WEATHER_OPTS,
 							 SOPT_IFTTT_KEY,
+							 SOPT_MQTT_OPTS,
 							 strlen(wt_rawData)==0?"{}":wt_rawData,
-							 wt_errCode);
+							 wt_errCode,
+							 SOPT_DEVICE_NAME);
+
+#if defined(SUPPORT_EMAIL)
+	bfill.emit_p(PSTR("\"email\":{$O},"), SOPT_EMAIL_OPTS);
+#endif
 
 #if defined(ARDUINO)
 	if(os.status.has_curr_sense) {
@@ -1152,7 +1178,7 @@ void server_json_controller_main() {
 	if(os.iopts[IOPT_SENSOR1_TYPE]==SENSOR_TYPE_FLOW) {
 		bfill.emit_p(PSTR("\"flcrt\":$L,\"flwrt\":$D,"), os.flowcount_rt, FLOWCOUNT_RT_WINDOW);
 	}
-	
+
 	bfill.emit_p(PSTR("\"sbits\":["));
 	// print sbits
 	for(bid=0;bid<os.nboards;bid++)
@@ -1162,52 +1188,66 @@ void server_json_controller_main() {
 	for(sid=0;sid<os.nstations;sid++) {
 		// if available ether buffer is getting small
 		// send out a packet
-		if(available_ether_buffer() < 60) {
-			send_packet();
+		if(available_ether_buffer() <= 0) {
+			send_packet(OTF_PARAMS);
 		}
 		unsigned long rem = 0;
-		byte qid = pd.station_qid[sid];
+		unsigned char qid = pd.station_qid[sid];
 		RuntimeQueueStruct *q = pd.queue + qid;
 		if (qid<255) {
 			rem = (curr_time >= q->st) ? (q->st+q->dur-curr_time) : q->dur;
 			if(rem>65535) rem = 0;
 		}
-		bfill.emit_p(PSTR("[$D,$L,$L]"), (qid<255)?q->pid:0, rem, (qid<255)?q->st:0);
+		bfill.emit_p(PSTR("[$D,$L,$L,$D]"),
+		(qid<255)?q->pid:0, rem, (qid<255)?q->st:0, os.attrib_grp[sid]);
 		bfill.emit_p((sid<os.nstations-1)?PSTR(","):PSTR("]"));
 	}
-	
-	//bfill.emit_p(PSTR(",\"blynk\":\"$O\""), SOPT_BLYNK_TOKEN);
-	//bfill.emit_p(PSTR(",\"mqtt\":\"$O\""), SOPT_MQTT_IP);
-	
+
+	unsigned char gpioList[] = PIN_FREE_LIST;
+	bfill.emit_p(PSTR(",\"gpio\":["));
+	for (unsigned char i = 0; i < sizeof(gpioList); ++i)
+	{
+		if(i != sizeof(gpioList) - 1) {
+			bfill.emit_p(PSTR("$D,"), gpioList[i]);
+		} else {
+			bfill.emit_p(PSTR("$D"), gpioList[i]);
+		}
+	}
+	bfill.emit_p(PSTR("]"));
+
 	bfill.emit_p(PSTR("}"));
 }
 
 /** Output controller variables in json */
-void server_json_controller() {
-#if defined(ESP8266)
-	if(!process_password()) return;
+void server_json_controller(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
 #endif
-	print_json_header();
-	server_json_controller_main();
+
+	bfill.emit_p(PSTR("{"));
+	server_json_controller_main(OTF_PARAMS);
 	handle_return(HTML_OK);
 }
 
 /** Output homepage */
-void server_home()
+void server_home(OTF_PARAMS_DEF)
 {
-#if defined(ESP8266)
 	rewind_ether_buffer();
+#if defined(USE_OTF)
+	print_header(OTF_PARAMS,false,strlen(ether_buffer));
+#else
+	print_header(false);
 #endif
-
-	print_html_standard_header();
-	
-	bfill.emit_p(PSTR("<!DOCTYPE html>\n<html>\n<head>\n$F</head>\n<body>\n<script>"), htmlMobileHeader);
+	bfill.emit_p(PSTR("<!DOCTYPE html><html><head>$F</head><body><script>"), htmlMobileHeader);
 	// send server variables and javascript packets
-	bfill.emit_p(PSTR("var ver=$D,ipas=$D;</script>\n"),
+	bfill.emit_p(PSTR("var ver=$D,ipas=$D;</script>"),
 							 OS_FW_VERSION, os.iopts[IOPT_IGNORE_PASSWORD]);
 
-	bfill.emit_p(PSTR("<script src=\"$O/home.js\"></script>\n</body>\n</html>"), SOPT_JAVASCRIPTURL);
+	bfill.emit_p(PSTR("<script src=\"$O/home.js\"></script></body></html>"), SOPT_JAVASCRIPTURL);
 
 	handle_return(HTML_OK);
 }
@@ -1225,45 +1265,44 @@ void server_home()
  * ap:	reset to ap (ESP8266 only)
  * update: launch update script (for OSPi/OSBo/Linux only)
  */
-void server_change_values()
+void server_change_values(OTF_PARAMS_DEF)
 {
-#if defined(ESP8266)
-	char *p = NULL;
-	extern unsigned long reboot_timer;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+#if defined(USE_OTF)
+	extern uint32_t reboot_timer;
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
-#endif	
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rsn"), true)) {
+#endif
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rsn"), true)) {
 		reset_all_stations();
 	}
 
 #if !defined(ARDUINO)
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("update"), true) && atoi(tmp_buffer) > 0) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("update"), true) && atoi(tmp_buffer) > 0) {
 		os.update_dev();
 	}
 #endif
 
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rbt"), true) && atoi(tmp_buffer) > 0) {
-		#if defined(ESP8266)
-			reboot_timer = millis() + 1000;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rbt"), true) && atoi(tmp_buffer) > 0) {
+		#if defined(USE_OTF)
+			os.status.safe_reboot = 0;
+			reboot_timer = os.now_tz() + 1;
 			handle_return(HTML_SUCCESS);
 		#else
-			print_html_standard_header();
+			print_header(false);
 			//bfill.emit_p(PSTR("Rebooting..."));
-			send_packet(true);
+			send_packet();
+			m_client->stop();
 			os.reboot_dev(REBOOT_CAUSE_WEB);
 		#endif
 	}
 
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
 		if (tmp_buffer[0]=='1' && !os.status.enabled)  os.enable();
 		else if (tmp_buffer[0]=='0' &&	os.status.enabled)	os.disable();
 	}
 
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rd"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rd"), true)) {
 		int rd = atoi(tmp_buffer);
 		if (rd>0) {
 			os.nvdata.rd_stop_time = os.now_tz() + (unsigned long) rd * 3600;
@@ -1273,7 +1312,7 @@ void server_change_values()
 		} else	handle_return(HTML_DATA_OUTOFBOUND);
 	}
 
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("re"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("re"), true)) {
 		if (tmp_buffer[0]=='1' && !os.iopts[IOPT_REMOTE_EXT_MODE]) {
 			os.iopts[IOPT_REMOTE_EXT_MODE] = 1;
 			os.iopts_save();
@@ -1282,11 +1321,11 @@ void server_change_values()
 			os.iopts_save();
 		}
 	}
-	
+
 	#if defined(ESP8266)
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ap"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ap"), true)) {
 		os.reset_to_ap();
-	}  
+	}
 	#endif
 	handle_return(HTML_SUCCESS);
 }
@@ -1310,33 +1349,37 @@ void string_remove_space(char *src) {
  * pw:	password
  * jsp: Javascript path
  */
-void server_change_scripturl() {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
-#else  
+void server_change_scripturl(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
+#else
 	char *p = get_buffer;
 #endif
-	
+
 #if defined(DEMO)
 	handle_return(HTML_REDIRECT_HOME);
 #endif
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("jsp"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("jsp"), true)) {
+		tmp_buffer[TMP_BUFFER_SIZE-1]=0;	// make sure we don't exceed the maximum size
 		urlDecode(tmp_buffer);
-		tmp_buffer[TMP_BUFFER_SIZE]=0;	// make sure we don't exceed the maximum size
 		// trim unwanted space characters
 		string_remove_space(tmp_buffer);
 		os.sopt_save(SOPT_JAVASCRIPTURL, tmp_buffer);
 	}
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("wsp"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("wsp"), true)) {
+		tmp_buffer[TMP_BUFFER_SIZE-1]=0;
 		urlDecode(tmp_buffer);
-		tmp_buffer[TMP_BUFFER_SIZE]=0;
 		string_remove_space(tmp_buffer);
 		os.sopt_save(SOPT_WEATHERURL, tmp_buffer);
 	}
+#if defined(USE_OTF)
+	rewind_ether_buffer();
+	print_header(OTF_PARAMS,false,strlen(ether_buffer));
+	bfill.emit_p(PSTR("$F"), htmlReturnHome);
+	handle_return(HTML_OK);
+#else
 	handle_return(HTML_REDIRECT_HOME);
+#endif
 }
 
 /**
@@ -1348,14 +1391,11 @@ void server_change_scripturl() {
  * loc: location
  * ttt: manual time (applicable only if ntp=0)
  */
-void server_change_options()
+void server_change_options(OTF_PARAMS_DEF)
 {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
-#else  
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
+#else
 	char *p = get_buffer;
 #endif
 
@@ -1367,10 +1407,10 @@ void server_change_options()
 	// !!! p and bfill share the same buffer, so don't write
 	// to bfill before you are done analyzing the buffer !!!
 	// process option values
-	byte err = 0;
-	byte prev_value;
-	byte max_value;
-	for (byte oid=0; oid<NUM_IOPTS; oid++) {
+	unsigned char err = 0;
+	unsigned char prev_value;
+	unsigned char max_value;
+	for (unsigned char oid=0; oid<NUM_IOPTS; oid++) {
 
 		// skip options that cannot be set through /co command
 		if (oid==IOPT_FW_VERSION || oid==IOPT_HW_VERSION || oid==IOPT_SEQUENTIAL_RETIRED ||
@@ -1379,12 +1419,12 @@ void server_change_options()
 			continue;
 		prev_value = os.iopts[oid];
 		max_value = pgm_read_byte(iopt_max+oid);
-		
+
 		// will no longer support oxx option names
 		// json name only
 		char tbuf2[6];
 		strncpy_P0(tbuf2, iopt_json_names+oid*5, 5);
-		if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
+		if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
 			int32_t v = atol(tmp_buffer);
 			if (oid==IOPT_MASTER_OFF_ADJ || oid==IOPT_MASTER_OFF_ADJ_2 ||
 					oid==IOPT_MASTER_ON_ADJ  || oid==IOPT_MASTER_ON_ADJ_2  ||
@@ -1398,9 +1438,9 @@ void server_change_options()
 				os.iopts[oid] = v;
 			} else {
 				err = 1;
-			}		 
+			}
 		}
-		
+
 		if (os.iopts[oid] != prev_value) {	// if value has changed
 			if (oid==IOPT_TIMEZONE || oid==IOPT_USE_NTP)		time_change = true;
 			if (oid>=IOPT_NTP_IP1 && oid<=IOPT_NTP_IP4)			time_change = true;
@@ -1409,64 +1449,77 @@ void server_change_options()
 		}
 	}
 
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("loc"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("loc"), true)) {
 		urlDecode(tmp_buffer);
 		if (os.sopt_save(SOPT_LOCATION, tmp_buffer)) { // if location string has changed
 			weather_change = true;
 		}
 	}
 	uint8_t keyfound = 0;
-	if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("wto"), true)) {
+	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("wto"), true)) {
 		urlDecode(tmp_buffer);
 		if (os.sopt_save(SOPT_WEATHER_OPTS, tmp_buffer)) {
-			weather_change = true;	// if wto has changed
+			if(os.iopts[IOPT_USE_WEATHER]==WEATHER_METHOD_MONTHLY) {
+				load_wt_monthly(tmp_buffer);
+				apply_monthly_adjustment(os.now_tz());
+			} else {
+				weather_change = true;	// if wto has changed
+			}
 		}
-	}
-	
-	keyfound = 0;
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ifkey"), true, &keyfound)) {
-		urlDecode(tmp_buffer);
-		os.sopt_save(SOPT_IFTTT_KEY, tmp_buffer);
-	} else if (keyfound) {
-		tmp_buffer[0]=0;
-		os.sopt_save(SOPT_IFTTT_KEY, tmp_buffer);
-	}
-	
-	/*
-	// wtkey is retired
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("wtkey"), true, &keyfound)) {
-		urlDecode(tmp_buffer);
-		if (os.sopt_save(SOPT_WEATHER_KEY, tmp_buffer)) {  // if weather key has changed
-			weather_change = true;
-		}
-	} else if (keyfound) {
-		tmp_buffer[0]=0;
-		os.sopt_save(SOPT_WEATHER_KEY, tmp_buffer);
-	}
-	
-	keyfound = 0;
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("blynk"), true, &keyfound)) {
-		urlDecode(tmp_buffer);
-		os.sopt_save(SOPT_BLYNK_TOKEN, tmp_buffer);
-	} else if (keyfound) {
-		tmp_buffer[0]=0;
-		os.sopt_save(SOPT_BLYNK_TOKEN, tmp_buffer);
+		//DEBUG_PRINTLN(os.sopt_load(SOPT_WEATHER_OPTS));
 	}
 
 	keyfound = 0;
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("mqtt"), true, &keyfound)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ifkey"), true, &keyfound)) {
 		urlDecode(tmp_buffer);
-		os.sopt_save(SOPT_MQTT_IP, tmp_buffer);
+		os.sopt_save(SOPT_IFTTT_KEY, tmp_buffer);
 	} else if (keyfound) {
 		tmp_buffer[0]=0;
-		os.sopt_save(SOPT_MQTT_IP, tmp_buffer);
+		os.sopt_save(SOPT_IFTTT_KEY, tmp_buffer);
 	}
-	*/
+
+	keyfound = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("otc"), true, &keyfound)) {
+		urlDecode(tmp_buffer);
+		os.sopt_save(SOPT_OTC_OPTS, tmp_buffer);
+	} else if (keyfound) {
+		tmp_buffer[0]=0;
+		os.sopt_save(SOPT_OTC_OPTS, tmp_buffer);
+	}
+
+	keyfound = 0;
+	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("mqtt"), true, &keyfound)) {
+		urlDecode(tmp_buffer);
+		os.sopt_save(SOPT_MQTT_OPTS, tmp_buffer);
+		os.status.req_mqtt_restart = true;
+	} else if (keyfound) {
+		tmp_buffer[0]=0;
+		os.sopt_save(SOPT_MQTT_OPTS, tmp_buffer);
+		os.status.req_mqtt_restart = true;
+	}
+
+	keyfound = 0;
+	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("email"), true, &keyfound)) {
+		urlDecode(tmp_buffer);
+		os.sopt_save(SOPT_EMAIL_OPTS, tmp_buffer);
+	} else if (keyfound) {
+		tmp_buffer[0]=0;
+		os.sopt_save(SOPT_EMAIL_OPTS, tmp_buffer);
+	}
+
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("dname"), true)) {
+		urlDecode(tmp_buffer);
+		strReplace(tmp_buffer, '\"', '\'');
+		strReplace(tmp_buffer, '\\', '/');
+		os.sopt_save(SOPT_DEVICE_NAME, tmp_buffer);
+	}
 
 	// if not using NTP and manually setting time
-	if (!os.iopts[IOPT_USE_NTP] && findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ttt"), true)) {
+	if (!os.iopts[IOPT_USE_NTP] && findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ttt"), true)) {
+#if defined(ARDUINO)
 		unsigned long t;
-		t = atol(tmp_buffer);
+		t = strtoul(tmp_buffer, NULL, 0);
+#endif
 		// before chaging time, reset all stations to avoid messing up with timing
 		reset_all_stations_immediate();
 #if defined(ARDUINO)
@@ -1477,16 +1530,17 @@ void server_change_options()
 	if (err)	handle_return(HTML_DATA_OUTOFBOUND);
 
 	os.iopts_save();
+	os.populate_master();
 
 	if(time_change) {
 		os.status.req_ntpsync = 1;
 	}
 
 	if(weather_change) {
-		os.iopts[IOPT_WATER_PERCENTAGE] = 100; // reset watering percentage to 100%
-		wt_rawData[0] = 0; 		// reset wt_rawData and errCode
-		wt_errCode = HTTP_RQT_NOT_RECEIVED;		
-		os.checkwt_lasttime = 0;	// force weather update
+		os.iopts[IOPT_WATER_PERCENTAGE] = 100;  // reset watering percentage to 100%
+		wt_rawData[0] = 0;  // reset wt_rawData and errCode
+		wt_errCode = HTTP_RQT_NOT_RECEIVED;
+		os.checkwt_lasttime = 0;  // force weather update
 	}
 
 	if(sensor_change) {
@@ -1504,23 +1558,21 @@ void server_change_options()
  * npw: new password
  * cpw: confirm new password
  */
-void server_change_password() {
+void server_change_password(OTF_PARAMS_DEF) {
 #if defined(DEMO)
-	handle_return(HTML_SUCCESS);	// do not allow chnaging password for demo
+	handle_return(HTML_SUCCESS);  // do not allow chnaging password for demo
 	return;
 #endif
 
-#if defined(ESP8266)
-	char* p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char* p = get_buffer;
 #endif
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("npw"), true)) {
-		char tbuf2[TMP_BUFFER_SIZE];
-		if (findKeyVal(p, tbuf2, TMP_BUFFER_SIZE, PSTR("cpw"), true) && strncmp(tmp_buffer, tbuf2, TMP_BUFFER_SIZE) == 0) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("npw"), true)) {
+		const int pwBufferSize = TMP_BUFFER_SIZE/2;
+		char *tbuf2 = tmp_buffer + pwBufferSize;	// use the second half of tmp_buffer 
+		if (findKeyVal(FKV_SOURCE, tbuf2, pwBufferSize, PSTR("cpw"), true) && strncmp(tmp_buffer, tbuf2, pwBufferSize) == 0) {
 			urlDecode(tmp_buffer);
 			os.sopt_save(SOPT_PASSWORD, tmp_buffer);
 			handle_return(HTML_SUCCESS);
@@ -1533,7 +1585,7 @@ void server_change_password() {
 
 void server_json_status_main() {
 	bfill.emit_p(PSTR("\"sn\":["));
-	byte sid;
+	unsigned char sid;
 
 	for (sid=0;sid<os.nstations;sid++) {
 		bfill.emit_p(PSTR("$D"), (os.station_bits[(sid>>3)]>>(sid&0x07))&1);
@@ -1543,46 +1595,48 @@ void server_json_status_main() {
 }
 
 /** Output station status */
-void server_json_status()
+void server_json_status(OTF_PARAMS_DEF)
 {
-#if defined(ESP8266)
-	if(!process_password()) return;
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
 #endif
-	print_json_header();
+
+	bfill.emit_p(PSTR("{"));
 	server_json_status_main();
 	handle_return(HTML_OK);
 }
 
 /**
  * Test station (previously manual operation)
- * Command: /cm?pw=xxx&sid=x&en=x&t=x
+ * Command: /cm?pw=xxx&sid=x&en=x&t=x&ssta=x
  *
  * pw: password
  * sid:station index (starting from 0)
  * en: enable (0 or 1)
  * t:  timer (required if en=1)
+ * ssta: shift remaining stations
  */
-void server_change_manual() {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+void server_change_manual(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
 #endif
 
 	int sid=-1;
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
 		sid=atoi(tmp_buffer);
 		if (sid<0 || sid>=os.nstations) handle_return(HTML_DATA_OUTOFBOUND);
 	} else {
 		handle_return(HTML_DATA_MISSING);
 	}
 
-	byte en=0;
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
+	unsigned char en=0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
 		en=atoi(tmp_buffer);
 	} else {
 		handle_return(HTML_DATA_MISSING);
@@ -1591,7 +1645,7 @@ void server_change_manual() {
 	uint16_t timer=0;
 	unsigned long curr_time = os.now_tz();
 	if (en) { // if turning on a station, must provide timer
-		if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("t"), true)) {
+		if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("t"), true)) {
 			timer=(uint16_t)atol(tmp_buffer);
 			if (timer==0 || timer>64800) {
 				handle_return(HTML_DATA_OUTOFBOUND);
@@ -1603,11 +1657,11 @@ void server_change_manual() {
 				handle_return(HTML_NOT_PERMITTED);
 
 			RuntimeQueueStruct *q = NULL;
-			byte sqi = pd.station_qid[sid];
+			unsigned char sqi = pd.station_qid[sid];
 			// check if the station already has a schedule
-			if (sqi!=0xFF) {	// if we, we will overwrite the schedule
+			if (sqi!=0xFF) {  // if so, we will overwrite the schedule
 				q = pd.queue+sqi;
-			} else {	// otherwise create a new queue element
+			} else {  // otherwise create a new queue element
 				q = pd.enqueue();
 			}
 			// if the queue is not full
@@ -1615,7 +1669,7 @@ void server_change_manual() {
 				q->st = 0;
 				q->dur = timer;
 				q->sid = sid;
-				q->pid = 99;	// testing stations are assigned program index 99
+				q->pid = 99;  // testing stations are assigned program index 99
 				schedule_all_stations(curr_time);
 			} else {
 				handle_return(HTML_NOT_PERMITTED);
@@ -1624,7 +1678,14 @@ void server_change_manual() {
 			handle_return(HTML_DATA_MISSING);
 		}
 	} else {	// turn off station
-		turn_off_station(sid, curr_time);
+		unsigned char ssta = 0;
+		if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ssta"), true)) {
+			ssta = atoi(tmp_buffer);
+		}
+		// mark station for removal
+		RuntimeQueueStruct *q = pd.queue + pd.station_qid[sid];
+		q->deque_time = curr_time;
+		turn_off_station(sid, curr_time, ssta);
 	}
 	handle_return(HTML_SUCCESS);
 }
@@ -1648,22 +1709,19 @@ int file_fgets(File file, char* buf, int maxsize) {
  * Get log data
  * Command: /jl?start=x&end=x&hist=x&type=x
  *
- * hist:	history (past n days)
- *				when hist is speceified, the start
- *				and end parameters below will be ignored
+ * hist:  history (past n days)
+ *        when hist is speceified, the start
+ *        and end parameters below will be ignored
  * start: start time (epoch time)
- * end:		end time (epoch time)
- * type:	type of log records (optional)
- *				rs, rd, wl
- *				if unspecified, output all records
+ * end:   end time (epoch time)
+ * type:  type of log records (optional)
+ *        rs, rd, wl
+ *        if unspecified, output all records
  */
-void server_json_log() {
+void server_json_log(OTF_PARAMS_DEF) {
 
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
 #else
 	char *p = get_buffer;
 #endif
@@ -1671,7 +1729,7 @@ void server_json_log() {
 	unsigned int start, end;
 
 	// past n day history
-	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("hist"), true)) {
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("hist"), true)) {
 		int hist = atoi(tmp_buffer);
 		if (hist< 0 || hist > 365) handle_return(HTML_DATA_OUTOFBOUND);
 		end = os.now_tz() / 86400L;
@@ -1679,13 +1737,13 @@ void server_json_log() {
 	}
 	else
 	{
-		if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("start"), true)) handle_return(HTML_DATA_MISSING);
+		if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("start"), true)) handle_return(HTML_DATA_MISSING);
 
-		start = atol(tmp_buffer) / 86400L;
+		start = strtoul(tmp_buffer, NULL, 0) / 86400L;
 
-		if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("end"), true)) handle_return(HTML_DATA_MISSING);
-		
-		end = atol(tmp_buffer) / 86400L;
+		if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("end"), true)) handle_return(HTML_DATA_MISSING);
+
+		end = strtoul(tmp_buffer, NULL, 0) / 86400L;
 
 		// start must be prior to end, and can't retrieve more than 365 days of data
 		if ((start>end) || (end-start)>365)  handle_return(HTML_DATA_OUTOFBOUND);
@@ -1694,29 +1752,27 @@ void server_json_log() {
 	// extract the type parameter
 	char type[4] = {0};
 	bool type_specified = false;
-	if (findKeyVal(p, type, 4, PSTR("type"), true))
+	if (findKeyVal(FKV_SOURCE, type, 4, PSTR("type"), true))
 		type_specified = true;
 
-#if defined(ESP8266)
+#if defined(USE_OTF)
 	// as the log data can be large, we will use ESP8266's sendContent function to
 	// send multiple packets of data, instead of the standard way of using send().
 	rewind_ether_buffer();
-	print_json_header(false);
-	//bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentJSON, htmlAccessControl, htmlNoCache);
-	//wifi_server->sendContent(ether_buffer);
+	print_header(OTF_PARAMS);
 #else
-	print_json_header(false);
+	print_header();
 #endif
 
 	bfill.emit_p(PSTR("["));
 
 	bool comma = 0;
 	for(unsigned int i=start;i<=end;i++) {
-		itoa(i, tmp_buffer, 10);
+		snprintf(tmp_buffer, TMP_BUFFER_SIZE*2 , "%d", i);
 		make_logfile_name(tmp_buffer);
 
 #if defined(ESP8266)
-		File file = SPIFFS.open(tmp_buffer, "r");
+		File file = LittleFS.open(tmp_buffer, "r");
 		if(!file) continue;
 #elif defined(ARDUINO)
 		if (!sd.exists(tmp_buffer)) continue;
@@ -1726,30 +1782,29 @@ void server_json_log() {
 		FILE *file = fopen(get_filename_fullpath(tmp_buffer), "rb");
 		if(!file) continue;
 #endif // prepare to open log file
-
-		int res;
+		int result;
 		while(true) {
 		#if defined(ESP8266)
-			// do not use file.readBytes or readBytesUntil because it's very slow
-			int res = file_fgets(file, tmp_buffer, TMP_BUFFER_SIZE);
-			if (res <= 0) {
+			// do not use file.read_byte or read_byteUntil because it's very slow
+			result = file_fgets(file, tmp_buffer, TMP_BUFFER_SIZE);
+			if (result <= 0) {
 				file.close();
 				break;
 			}
-			tmp_buffer[res]=0;
+			tmp_buffer[result]=0;
 		#elif defined(ARDUINO)
-			res = file.fgets(tmp_buffer, TMP_BUFFER_SIZE);
-			if (res <= 0) {
+			result = file.fgets(tmp_buffer, TMP_BUFFER_SIZE);
+			if (result <= 0) {
 				file.close();
 				break;
 			}
 		#else
 			if(fgets(tmp_buffer, TMP_BUFFER_SIZE, file)) {
-				res = strlen(tmp_buffer);
+				result = strlen(tmp_buffer);
 			} else {
-				res = 0;
+				result = 0;
 			}
-			if (res <= 0) {
+			if (result <= 0) {
 				fclose(file);
 				break;
 			}
@@ -1764,7 +1819,7 @@ void server_json_log() {
 			tmp_buffer[TMP_BUFFER_SIZE-1]=0; // make sure the search will end
 			while(*ptype && *ptype != ',') ptype++;
 			if(*ptype != ',') continue; // didn't find comma, move on
-			ptype++;	// move past comma
+			ptype++;  // move past comma
 
 			if (type_specified && strncmp(type, ptype+1, 2))
 				continue;
@@ -1777,8 +1832,8 @@ void server_json_log() {
 			bfill.emit_p(PSTR("$S"), tmp_buffer);
 			// if the available ether buffer size is getting small
 			// push out a packet
-			if (available_ether_buffer() < 60) {
-				send_packet();
+			if (available_ether_buffer() <= 0) {
+				send_packet(OTF_PARAMS);
 			}
 		}
 	}
@@ -1789,23 +1844,20 @@ void server_json_log() {
 /**
  * Delete log
  * Command: /dl?pw=xxx&day=xxx
- *					/dl?pw=xxx&day=all
+ *          /dl?pw=xxx&day=all
  *
  * pw: password
  * day:day (epoch time / 86400)
  * if day=all: delete all log files)
  */
-void server_delete_log() {
-#if defined(ESP8266)
-	char *p = NULL;
-	if(!process_password()) return;
-	if (m_client)
-		p = get_buffer;  
-#else  
+void server_delete_log(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
+#else
 	char *p = get_buffer;
 #endif
 
-	if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("day"), true))
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("day"), true))
 		handle_return(HTML_DATA_MISSING);
 
 	delete_log(tmp_buffer);
@@ -1813,58 +1865,142 @@ void server_delete_log() {
 	handle_return(HTML_SUCCESS);
 }
 
-/** Output all JSON data, including jc, jp, jo, js, jn */
-void server_json_all() {
-#if defined(ESP8266)
-	if(!process_password(true)) return;
-	rewind_ether_buffer();
+/**
+ * Command: "/pq?pw=x&dur=x"
+ * dur: duration (in units of seconds)
+ */
+void server_pause_queue(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
+#else
+	char *p = get_buffer;
 #endif
-	print_json_header();
-	bfill.emit_p(PSTR("\"settings\":{"));
-	server_json_controller_main();
-	send_packet();
+
+	ulong duration = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("dur"), true)) {
+		duration = strtoul(tmp_buffer, NULL, 0);
+	}
+
+	pd.toggle_pause(duration);
+
+	handle_return(HTML_SUCCESS);
+}
+
+/** Output all JSON data, including jc, jp, jo, js, jn */
+void server_json_all(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS,true)) return;
+	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
+#endif
+	bfill.emit_p(PSTR("{\"settings\":{"));
+	server_json_controller_main(OTF_PARAMS);
+	send_packet(OTF_PARAMS);
 	bfill.emit_p(PSTR(",\"programs\":{"));
-	server_json_programs_main();
-	send_packet();
+	server_json_programs_main(OTF_PARAMS);
+	send_packet(OTF_PARAMS);
 	bfill.emit_p(PSTR(",\"options\":{"));
 	server_json_options_main();
-	send_packet();
+	send_packet(OTF_PARAMS);
 	bfill.emit_p(PSTR(",\"status\":{"));
 	server_json_status_main();
-	send_packet();
+	send_packet(OTF_PARAMS);
 	bfill.emit_p(PSTR(",\"stations\":{"));
-	server_json_stations_main();
+	server_json_stations_main(OTF_PARAMS);
 	bfill.emit_p(PSTR("}"));
 	handle_return(HTML_OK);
 }
 
-#if defined(ARDUINO) && !defined(ESP8266)
-static int freeHeap () {
-  extern int __heap_start, *__brkval; 
-  int v; 
-  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
-}
-#endif
-
 #if defined(ARDUINO)
-void server_json_debug() {
-  rewind_ether_buffer();
-  print_json_header();
-  bfill.emit_p(PSTR("\"date\":\"$S\",\"time\":\"$S\",\"heap\":$D"), __DATE__, __TIME__,
-  #if defined(ESP8266)
-  (uint16_t)ESP.getFreeHeap());
-  FSInfo fs_info;
-	SPIFFS.info(fs_info);
-  bfill.emit_p(PSTR(",\"flash\":$D,\"used\":$D}"), fs_info.totalBytes, fs_info.usedBytes);
-  #else
-  (uint16_t)freeHeap());
-  bfill.emit_p(PSTR("}"));
-  #endif
-  handle_return(HTML_OK);
+
+#if defined(OS_AVR)
+static int freeHeap () {
+	extern int __heap_start, *__brkval;
+	int v;
+	return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
+}
+#endif
+#else
+#include <sys/sysinfo.h>
+static unsigned long freeHeap() {
+	//return sysconf(_SC_AVPHYS_PAGES) * sysconf(_SC_PAGESIZE);
+	struct sysinfo info;
+	if (sysinfo(&info) == 0) {
+		return info.freeram;
+	} else {
+		return 0;
+	}
 }
 #endif
 
-typedef void (*URLHandler)(void);
+void server_json_debug(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
+#endif
+	bfill.emit_p(PSTR("{\"date\":\"$S\",\"time\":\"$S\",\"heap\":$L"), __DATE__, __TIME__,
+#if defined(ESP8266)
+	(unsigned long)ESP.getFreeHeap());
+	FSInfo fs_info;
+	LittleFS.info(fs_info);
+	bfill.emit_p(PSTR(",\"flash\":$D,\"used\":$D,"), fs_info.totalBytes, fs_info.usedBytes);
+	if(useEth) {
+		bfill.emit_p(PSTR("\"isW5500\":$D}"), eth.isW5500);
+	} else {
+		bfill.emit_p(PSTR("\"rssi\":$D,\"bssid\":\"$S\",\"bssidchl\":\"$O\"}"),
+		WiFi.RSSI(), WiFi.BSSIDstr().c_str(), SOPT_STA_BSSID_CHL);
+	}
+
+/*
+// print out all log files and all files in the main folder with file sizes
+	DEBUG_PRINTLN(F("List Files:"));
+	Dir dir = LittleFS.openDir("/logs/");
+	while (dir.next()) {
+		DEBUG_PRINT(dir.fileName());
+		DEBUG_PRINT("/");
+		DEBUG_PRINTLN(dir.fileSize());
+	}
+	dir = LittleFS.openDir("/");
+	while (dir.next()) {
+		DEBUG_PRINT(dir.fileName());
+		DEBUG_PRINT("/");
+		DEBUG_PRINTLN(dir.fileSize());
+	}
+*/
+#else
+	(unsigned long)freeHeap());
+	bfill.emit_p(PSTR("}"));
+#endif
+	handle_return(HTML_OK);
+}
+
+/*
+// fill ESP8266 flash with some dummy files
+void server_fill_files(OTF_PARAMS_DEF) {
+	memset(ether_buffer, 65, 75);
+	ether_buffer[75] = 0;
+	FSInfo fs_info;
+	for(int index=1;index<64;index++) {
+		snprintf(tmp_buffer, TMP_BUFFER_SIZE*2 , "%d", index);
+		make_logfile_name(tmp_buffer);
+		DEBUG_PRINT(F("creating "));
+		DEBUG_PRINT(tmp_buffer);
+		File file = LittleFS.open(tmp_buffer, "w");
+		file.write(ether_buffer, strlen(ether_buffer));
+		file.close();
+		DEBUG_PRINTLN(F(" done. "));
+		LittleFS.info(fs_info);
+		DEBUG_PRINTLN(fs_info.usedbytes);
+	}
+	handle_return(HTML_SUCCESS);
+}
+*/
+
+typedef void (*URLHandler)(OTF_PARAMS_DEF);
 
 /* Server function urls
  * To save RAM space, each GET command keyword is exactly
@@ -1894,71 +2030,82 @@ const char _url_keys[] PROGMEM =
 	"su"
 	"cu"
 	"ja"
-#if defined(ARDUINO)  
-  "db"
-#endif	
+	"pq"
+    "db"
+#if defined(ARDUINO)
+	//"ff"
+#endif
 	;
 
 // Server function handlers
 URLHandler urls[] = {
-	server_change_values,		// cv
+	server_change_values,   // cv
 	server_json_controller, // jc
-	server_delete_program,	// dp
-	server_change_program,	// cp
-	server_change_runonce,	// cr
-	server_manual_program,	// mp  
-	server_moveup_program,	// up
-	server_json_programs,		// jp
-	server_change_options,	// co
-	server_json_options,		// jo
+	server_delete_program,  // dp
+	server_change_program,  // cp
+	server_change_runonce,  // cr
+	server_manual_program,  // mp
+	server_moveup_program,  // up
+	server_json_programs,   // jp
+	server_change_options,  // co
+	server_json_options,    // jo
 	server_change_password, // sp
-	server_json_status,			// js
-	server_change_manual,		// cm
+	server_json_status,     // js
+	server_change_manual,   // cm
 	server_change_stations, // cs
-	server_json_stations,		// jn
+	server_json_stations,   // jn
 	server_json_station_special,// je
-	server_json_log,				// jl
-	server_delete_log,			// dl
-	server_view_scripturl,	// su
+	server_json_log,        // jl
+	server_delete_log,      // dl
+	server_view_scripturl,  // su
 	server_change_scripturl,// cu
-	server_json_all,				// ja
-#if defined(ARDUINO)  
-  server_json_debug,			// db
-#endif	
+	server_json_all,        // ja
+	server_pause_queue,     // pq
+	server_json_debug,      // db
+#if defined(ARDUINO)
+	//server_fill_files,
+#endif
 };
 
 // handle Ethernet request
 #if defined(ESP8266)
-void on_ap_update() {
-	String html = FPSTR(ap_update_html);
-	server_send_html(html);
+void on_ap_update(OTF_PARAMS_DEF) {
+	print_header(OTF_PARAMS, false, strlen_P((char*)ap_update_html));
+	res.writeBodyChunk((char *) "%s", ap_update_html);
 }
 
-void on_sta_update() {
-	String html = FPSTR(sta_update_html);
-	server_send_html(html);
+void on_sta_update(OTF_PARAMS_DEF) {
+	if(req.isCloudRequest()) otf_send_result(OTF_PARAMS, HTML_NOT_PERMITTED, "fw update");
+	else {
+		print_header(OTF_PARAMS, false, strlen_P((char*)sta_update_html));
+		res.writeBodyChunk((char *) "%s", sta_update_html);
+	}
 }
 
 void on_sta_upload_fin() {
-	if(!process_password()) {
+	if(!(update_server->hasArg("pw") && os.password_verify(update_server->arg("pw").c_str()))) {
+		update_server_send_result(HTML_UNAUTHORIZED);
 		Update.end(false);
 		return;
 	}
 	// finish update and check error
 	if(!Update.end(true) || Update.hasError()) {
-		handle_return(HTML_UPLOAD_FAILED);
+		update_server_send_result(HTML_UPLOAD_FAILED);
+		//handle_return(HTML_UPLOAD_FAILED);
 	}
-	
-	server_send_result(HTML_SUCCESS);
+
+	update_server_send_result(HTML_SUCCESS);
 	os.reboot_dev(REBOOT_CAUSE_FWUPDATE);
 }
 
 void on_ap_upload_fin() { on_sta_upload_fin(); }
 
 void on_sta_upload() {
-	HTTPUpload& upload = wifi_server->upload();
+	HTTPUpload& upload = update_server->upload();
 	if(upload.status == UPLOAD_FILE_START){
-		WiFiUDP::stopAll();
+		// todo:
+		// WiFiUDP::stopAll();
+		//mqtt_client->disconnect();
 		DEBUG_PRINT(F("upload: "));
 		DEBUG_PRINTLN(upload.filename);
 		uint32_t maxSketchSpace = (ESP.getFreeSketchSpace()-0x1000)&0xFFFFF000;
@@ -1966,44 +2113,17 @@ void on_sta_upload() {
 			DEBUG_PRINT(F("begin failed "));
 			DEBUG_PRINTLN(maxSketchSpace);
 		}
-		
-	} else if(upload.status == UPLOAD_FILE_WRITE) {
-		DEBUG_PRINT(".");
-		if(Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-			DEBUG_PRINTLN(F("size mismatch"));
-		}
-			
-	} else if(upload.status == UPLOAD_FILE_END) {
-		
-		DEBUG_PRINTLN(F("completed"));
-	 
-	} else if(upload.status == UPLOAD_FILE_ABORTED){
-		Update.end();
-		DEBUG_PRINTLN(F("aborted"));
-	}
-	delay(0);		 
-}
 
-void on_ap_upload() { 
-	HTTPUpload& upload = wifi_server->upload();
-	if(upload.status == UPLOAD_FILE_START){
-		DEBUG_PRINT(F("upload: "));
-		DEBUG_PRINTLN(upload.filename);
-		uint32_t maxSketchSpace = (ESP.getFreeSketchSpace()-0x1000)&0xFFFFF000;
-		if(!Update.begin(maxSketchSpace)) {
-			DEBUG_PRINTLN(F("begin failed"));
-			DEBUG_PRINTLN(maxSketchSpace);			
-		}
 	} else if(upload.status == UPLOAD_FILE_WRITE) {
 		DEBUG_PRINT(".");
 		if(Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
 			DEBUG_PRINTLN(F("size mismatch"));
 		}
-			
+
 	} else if(upload.status == UPLOAD_FILE_END) {
-		
+
 		DEBUG_PRINTLN(F("completed"));
-			 
+
 	} else if(upload.status == UPLOAD_FILE_ABORTED){
 		Update.end();
 		DEBUG_PRINTLN(F("aborted"));
@@ -2011,52 +2131,58 @@ void on_ap_upload() {
 	delay(0);
 }
 
+void on_ap_upload() { on_sta_upload(); }
+
 void start_server_client() {
-	if(!wifi_server) return;
-	
-	wifi_server->on("/", server_home);	// handle home page
-	wifi_server->on("/index.html", server_home);
-	wifi_server->on("/update", HTTP_GET, on_sta_update); // handle firmware update
-	wifi_server->on("/update", HTTP_POST, on_sta_upload_fin, on_sta_upload);	
-	
-	// set up all other handlers
-	char uri[4];
-	uri[0]='/';
-	uri[3]=0;
-	for(int i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
-		uri[1]=pgm_read_byte(_url_keys+2*i);
-		uri[2]=pgm_read_byte(_url_keys+2*i+1);
-		wifi_server->on(uri, urls[i]);
+	if(!otf) return;
+	static bool callback_initialized = false;
+
+	if(!callback_initialized) {
+		otf->on("/", server_home);  // handle home page
+		otf->on("/index.html", server_home);
+		otf->on("/update", on_sta_update, OTF::HTTP_GET); // handle firmware update
+		update_server->on("/update", HTTP_POST, on_sta_upload_fin, on_sta_upload);
+
+		// set up all other handlers
+		char uri[4];
+		uri[0]='/';
+		uri[3]=0;
+		for(unsigned char i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
+			uri[1]=pgm_read_byte(_url_keys+2*i);
+			uri[2]=pgm_read_byte(_url_keys+2*i+1);
+			otf->on(uri, urls[i]);
+		}
+		callback_initialized = true;
 	}
-	wifi_server->begin();
+	update_server->begin();
 }
 
 void start_server_ap() {
-	if(!wifi_server) return;
-	
+	if(!otf) return;
+
 	scanned_ssids = scan_network();
 	String ap_ssid = get_ap_ssid();
 	start_network_ap(ap_ssid.c_str(), NULL);
 	delay(500);
-	wifi_server->on("/", on_ap_home);
-	wifi_server->on("/jsap", on_ap_scan);
-	wifi_server->on("/ccap", on_ap_change_config);
-	wifi_server->on("/jtap", on_ap_try_connect);
-	wifi_server->on("/update", HTTP_GET, on_ap_update);
-	wifi_server->on("/update", HTTP_POST, on_ap_upload_fin, on_ap_upload);
-	wifi_server->onNotFound(on_ap_home);
+	otf->on("/", on_ap_home);
+	otf->on("/jsap", on_ap_scan);
+	otf->on("/ccap", on_ap_change_config);
+	otf->on("/jtap", on_ap_try_connect);
+	otf->on("/update", on_ap_update, OTF::HTTP_GET);
+	update_server->on("/update", HTTP_POST, on_ap_upload_fin, on_ap_upload);
+	otf->onMissingPage(on_ap_home);
+	update_server->begin();
 
 	// set up all other handlers
 	char uri[4];
 	uri[0]='/';
 	uri[3]=0;
-	for(int i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
+	for(unsigned char i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
 		uri[1]=pgm_read_byte(_url_keys+2*i);
 		uri[2]=pgm_read_byte(_url_keys+2*i+1);
-		wifi_server->on(uri, urls[i]);
+		otf->on(uri, urls[i]);
 	}
-	
-	wifi_server->begin();
+
 	os.lcd.setCursor(0, -1);
 	os.lcd.print(F("OSAP:"));
 	os.lcd.print(ap_ssid);
@@ -2066,6 +2192,31 @@ void start_server_ap() {
 
 #endif
 
+#if defined(USE_OTF) && !defined(ARDUINO)
+void initalize_otf() {
+	if(!otf) return;
+	static bool callback_initialized = false;
+
+	if(!callback_initialized) {
+		otf->on("/", server_home);  // handle home page
+		otf->on("/index.html", server_home);
+
+		// set up all other handlers
+		char uri[4];
+		uri[0]='/';
+		uri[3]=0;
+		for(unsigned char i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
+			uri[1]=pgm_read_byte(_url_keys+2*i);
+			uri[2]=pgm_read_byte(_url_keys+2*i+1);
+			otf->on(uri, urls[i]);
+		}
+		callback_initialized = true;
+	}
+}
+#endif
+
+#if !defined(USE_OTF)
+// This funtion is only used for non-OTF platforms
 void handle_web_request(char *p) {
 	rewind_ether_buffer();
 
@@ -2075,11 +2226,12 @@ void handle_web_request(char *p) {
 	char *dat = com+3;
 
 	if(com[0]==' ') {
-		server_home();	// home page handler
-		send_packet(true);
+		server_home();  // home page handler
+		send_packet();
+		m_client->stop();
 	} else {
 		// server funtion handlers
-		byte i;
+		unsigned char i;
 		for(i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
 			if(pgm_read_byte(_url_keys+2*i)==com[0]
 			 &&pgm_read_byte(_url_keys+2*i+1)==com[1]) {
@@ -2092,14 +2244,10 @@ void handle_web_request(char *p) {
 					(urls[i])();
 					ret = return_code;
 				} else if ((com[0]=='j' && com[1]=='o') ||
-									 (com[0]=='j' && com[1]=='a'))	{ // for /jo and /ja we output fwv if password fails
-#if defined(ESP8266)
-					if(process_password(false, dat)==false) {
-#else
+									 (com[0]=='j' && com[1]=='a'))  { // for /jo and /ja we output fwv if password fails
 					if(check_password(dat)==false) {
-#endif
-						print_json_header();
-						bfill.emit_p(PSTR("\"$F\":$D}"),
+						print_header();
+						bfill.emit_p(PSTR("{\"$F\":$D}"),
 									 iopt_json_names+0, os.iopts[0]);
 						ret = HTML_OK;
 					} else {
@@ -2113,11 +2261,7 @@ void handle_web_request(char *p) {
 					ret = return_code;
 				} else {
 					// first check password
-#if defined(ESP8266)
-					if(process_password(false, dat)==false) {
-#else
 					if(check_password(dat)==false) {
-#endif
 						ret = HTML_UNAUTHORIZED;
 					} else {
 						get_buffer = dat;
@@ -2128,22 +2272,18 @@ void handle_web_request(char *p) {
 				if (ret == -1) {
 					if (m_client)
 						m_client->stop();
-#if defined(ESP8266)
-					else
-						 wifi_server->client().stop();
-#endif
 					return;
-				}				 
+				}
 				switch(ret) {
 				case HTML_OK:
 					break;
 				case HTML_REDIRECT_HOME:
-					print_html_standard_header();
+					print_header(false);
 					bfill.emit_p(PSTR("$F"), htmlReturnHome);
 					break;
 				default:
-					print_json_header();
-					bfill.emit_p(PSTR("\"result\":$D}"), ret);
+					print_header();
+					bfill.emit_p(PSTR("{\"result\":$D}"), ret);
 				}
 				break;
 			}
@@ -2151,155 +2291,154 @@ void handle_web_request(char *p) {
 
 		if(i==sizeof(urls)/sizeof(URLHandler)) {
 			// no server funtion found
-			print_json_header();
-			bfill.emit_p(PSTR("\"result\":$D}"), HTML_PAGE_NOT_FOUND);
+			print_header();
+			bfill.emit_p(PSTR("{\"result\":$D}"), HTML_PAGE_NOT_FOUND);
 		}
-		send_packet(true);
+		send_packet();
+		m_client->stop();
 	}
-	//delay(50); // add a bit of delay here
-
 }
-
-#if defined(ESP8266)
-#include "NTPClient.h"
-static EthernetUDP udp;
-static NTPClient *ntp = 0;
-extern EthernetServer *m_server;
-static char _ntpip[16];
 #endif
 
 #if defined(ARDUINO)
+#define NTP_NTRIES 10
 /** NTP sync request */
-ulong getNtpTime()
-{
 #if defined(ESP8266)
-	if (m_server) {
-		if (!ntp) {
-			String ntpip = "";
-			ntpip+=os.iopts[IOPT_NTP_IP1];
-			ntpip+=".";
-			ntpip+=os.iopts[IOPT_NTP_IP2];
-			ntpip+=".";
-			ntpip+=os.iopts[IOPT_NTP_IP3];
-			ntpip+=".";
-			ntpip+=os.iopts[IOPT_NTP_IP4];
-			strcpy(_ntpip, ntpip.c_str());
-			if (!os.iopts[IOPT_NTP_IP1] || os.iopts[IOPT_NTP_IP1] == '0')
-				strcpy(_ntpip, "pool.ntp.org");
-
-			DEBUG_PRINTLN(_ntpip);
-			ntp = new NTPClient(udp, _ntpip);
-			ntp->begin();
-			delay(1000);
-		}
-		ulong gt = 0;
-		byte tick=0;
-		if (ntp->update()) {
-			do {
-				gt = ntp->getEpochTime();
-				tick++;
-				delay(1000);
-			} while(gt<978307200L && tick<20);
-			if(gt<978307200L) {
-				DEBUG_PRINTLN(F("NTP-E failed!"));
-				gt=0;
-			} else {
-				DEBUG_PRINTLN(F("NTP-E done."));
-			}
-		}
-		return gt;
-	}
-	
+// due to lwip not supporting UDP, we have to use configTime and time() functions
+// othewise, using UDP is much faster for NTP sync
+ulong getNtpTime() {
 	static bool configured = false;
-		
-	if (os.state!=OS_STATE_CONNECTED || WiFi.status()!=WL_CONNECTED) return 0;
-	
+	static char customAddress[16];
 	if(!configured) {
-		String ntpip = "";
-		ntpip+=os.iopts[IOPT_NTP_IP1];
-		ntpip+=".";
-		ntpip+=os.iopts[IOPT_NTP_IP2];
-		ntpip+=".";
-		ntpip+=os.iopts[IOPT_NTP_IP3];
-		ntpip+=".";
-		ntpip+=os.iopts[IOPT_NTP_IP4];
-		
-		strcpy(_ntpip, ntpip.c_str());
-		if (!os.iopts[IOPT_NTP_IP1] || os.iopts[IOPT_NTP_IP1] == '0')
-				strcpy(_ntpip, "pool.ntp.org");
-		DEBUG_PRINTLN(_ntpip);
-		configTime(0, 0, _ntpip, "time.nist.gov");
-		delay(1000);
+		unsigned char ntpip[4] = {
+		os.iopts[IOPT_NTP_IP1],
+		os.iopts[IOPT_NTP_IP2],
+		os.iopts[IOPT_NTP_IP3],
+		os.iopts[IOPT_NTP_IP4]};	// todo: handle changes to ntpip dynamically
+		if (!os.iopts[IOPT_NTP_IP1] || os.iopts[IOPT_NTP_IP1] == '0') {
+			DEBUG_PRINTLN(F("using default time servers"));
+			configTime(0, 0, "time.google.com", "time.nist.gov", "time.windows.com");
+		} else {
+			DEBUG_PRINTLN(F("using custom time server"));
+			String ntp = IPAddress(ntpip[0],ntpip[1],ntpip[2],ntpip[3]).toString();
+			strncpy(customAddress, ntp.c_str(), sizeof customAddress);
+			customAddress[sizeof customAddress - 1] = 0;
+			configTime(0, 0, customAddress, "time.google.com", "time.nist.gov");
+		}
 		configured = true;
 	}
+	unsigned char tries = 0;
 	ulong gt = 0;
-	byte tick=0;
-	do {
-		gt = time(nullptr);
-		tick++;
+	while(tries<NTP_NTRIES) {
+		gt = time(NULL);
+		if(gt>1577836800UL)	break;
+		else gt = 0;
 		delay(1000);
-	} while(gt<978307200L && tick<20);
-	if(gt<978307200L)  {
-		DEBUG_PRINTLN(F("NTP failed!"));
-		gt=0;
-	} else {
-		DEBUG_PRINTLN(F("NTP done."));
-	}  
+		tries++;
+	}
 	return gt;
-	
-#else
-	// the following is from Arduino UdpNtpClient code
-	const int NTP_PACKET_SIZE = 48;
-	static byte packetBuffer[NTP_PACKET_SIZE];
-	byte ntpip[4] = {
+}
+#else	// AVR
+ulong getNtpTime() {
+
+	// only proceed if we are connected
+	if(!os.network_connected()) return 0;
+
+	uint16_t port = (uint16_t)(os.iopts[IOPT_HTTPPORT_1]<<8) + (uint16_t)os.iopts[IOPT_HTTPPORT_0];
+	port = (port==8000) ? 8888:8000; // use a different port than http port
+	UDP *udp = new EthernetUDP();
+
+	#define NTP_PACKET_SIZE 48
+	#define NTP_PORT 123
+	#define N_PUBLIC_SERVERS 5
+
+	static const char* public_ntp_servers[] = {
+		"time.google.com",
+		"time.nist.gov",
+		"time.windows.com",
+		"time.cloudflare.com",
+		"pool.ntp.org" };
+	static uint8_t sidx = 0;
+
+	static unsigned char packetBuffer[NTP_PACKET_SIZE];
+	unsigned char ntpip[4] = {
 		os.iopts[IOPT_NTP_IP1],
 		os.iopts[IOPT_NTP_IP2],
 		os.iopts[IOPT_NTP_IP3],
 		os.iopts[IOPT_NTP_IP4]};
-	byte tick=0;
-	do {
+	unsigned char tries=0;
+	ulong gt = 0;
+	ulong startt = millis();
+	while(tries<NTP_NTRIES) {
 		// sendNtpPacket
+		udp->begin(port);
+
 		memset(packetBuffer, 0, NTP_PACKET_SIZE);
-		packetBuffer[0] = 0b11100011;		// LI, Version, Mode
-		packetBuffer[1] = 0;		 // Stratum, or type of clock
-		packetBuffer[2] = 6;		 // Polling Interval
+		packetBuffer[0] = 0b11100011;  // LI, Version, Mode
+		packetBuffer[1] = 0;  // Stratum, or type of clock
+		packetBuffer[2] = 6;  // Polling Interval
 		packetBuffer[3] = 0xEC;  // Peer Clock Precision
 		// 8 bytes of zero for Root Delay & Root Dispersion
-		packetBuffer[12]	= 49;
-		packetBuffer[13]	= 0x4E;
-		packetBuffer[14]	= 49;
-		packetBuffer[15]	= 52;
-		// all NTP fields have been given values, now
-		// you can send a packet requesting a timestamp:
+		packetBuffer[12] = 49;
+		packetBuffer[13] = 0x4E;
+		packetBuffer[14] = 49;
+		packetBuffer[15] = 52;
+
+		// use one of the public NTP servers if ntp ip is unset
+
+		DEBUG_PRINT(F("ntp: "));
+		int ret;
 		if (!os.iopts[IOPT_NTP_IP1] || os.iopts[IOPT_NTP_IP1] == '0') {
-			DEBUG_PRINTLN(F("using pool.ntp"));
-			Udp->beginPacket("pool.ntp.org", 123); // NTP requests are to port 123
+			DEBUG_PRINT(public_ntp_servers[sidx]);
+			ret = udp->beginPacket(public_ntp_servers[sidx], NTP_PORT);
 		} else {
-			DEBUG_PRINTLN(ntpip[0]);
-			Udp->beginPacket(ntpip, 123);
-			
+			DEBUG_PRINTLN(IPAddress(ntpip[0],ntpip[1],ntpip[2],ntpip[3]));
+			ret = udp->beginPacket(ntpip, NTP_PORT);
 		}
-		Udp->write(packetBuffer, NTP_PACKET_SIZE);
-		Udp->endPacket();
+		if(ret!=1) {
+			DEBUG_PRINT(F(" not available (ret: "));
+			DEBUG_PRINT(ret);
+			DEBUG_PRINTLN(")");
+			udp->stop();
+			tries++;
+			sidx=(sidx+1)%N_PUBLIC_SERVERS;
+			continue;
+		} else {
+			DEBUG_PRINTLN(F(" connected"));
+		}
+		udp->write(packetBuffer, NTP_PACKET_SIZE);
+		udp->endPacket();
 		// end of sendNtpPacket
-		
-		// wait for response
-		delay(1000);
-		if(Udp->parsePacket()) {
-			Udp->read(packetBuffer, NTP_PACKET_SIZE);
-			unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-			unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-			// combine the four bytes (two words) into a long integer
-			// this is NTP time (seconds since Jan 1 1900):
-			unsigned long secsSince1900 = highWord << 16 | lowWord;
-			// Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-			const unsigned long seventyYears = 2208988800UL;
-			// subtract seventy years:
-			return secsSince1900 - seventyYears;
+
+		// process response
+		ulong timeout = millis()+2000;
+		while(millis() < timeout) {
+			if(udp->parsePacket()) {
+				udp->read(packetBuffer, NTP_PACKET_SIZE);
+				ulong highWord = word(packetBuffer[40], packetBuffer[41]);
+				ulong lowWord = word(packetBuffer[42], packetBuffer[43]);
+				ulong secsSince1900 = highWord << 16 | lowWord;
+				ulong seventyYears = 2208988800UL;
+				ulong gt = secsSince1900 - seventyYears;
+				// check validity: has to be larger than 1/1/2020 12:00:00
+				if(gt>1577836800UL) {
+					udp->stop();
+					delete udp;
+					DEBUG_PRINT(F("took "));
+					DEBUG_PRINT(millis()-startt);
+					DEBUG_PRINTLN(F("ms"));
+					return gt;
+				}
+			}
 		}
-		tick ++;
-	} while(tick<5);
-#endif
+		tries++;
+		udp->stop();
+		sidx=(sidx+1)%N_PUBLIC_SERVERS;
+	}
+	if(tries==NTP_NTRIES) {DEBUG_PRINTLN(F("NTP failed!!"));}
+	udp->stop();
+	delete udp;
 	return 0;
 }
+#endif
 #endif

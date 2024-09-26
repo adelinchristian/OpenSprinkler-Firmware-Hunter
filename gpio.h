@@ -18,7 +18,7 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see
- * <http://www.gnu.org/licenses/>. 
+ * <http://www.gnu.org/licenses/>.
  */
 
 #ifndef GPIO_H
@@ -45,10 +45,12 @@
 class IOEXP {
 public:
 	IOEXP(uint8_t addr=255) { address = addr; type = IOEXP_TYPE_NONEXIST; }
-	
+
 	virtual void pinMode(uint8_t pin, uint8_t IOMode) { }
 	virtual uint16_t i2c_read(uint8_t reg) { return 0xFFFF; }
 	virtual void i2c_write(uint8_t reg, uint16_t v) { }
+	// software implementation of shift register out
+	virtual void shift_out(uint8_t plat, uint8_t pclk, uint8_t pdat, uint8_t v) { }
 
 	void digitalWrite(uint16_t v) {
 		i2c_write(NXP_OUTPUT_REG, v);
@@ -69,7 +71,7 @@ public:
 		i2c_write(NXP_OUTPUT_REG, values);
 	}
 
-	static byte detectType(uint8_t address);
+	static unsigned char detectType(uint8_t address);
 	uint8_t address;
 	uint8_t type;
 };
@@ -80,6 +82,7 @@ public:
 	void pinMode(uint8_t pin, uint8_t IOMode);
 	uint16_t i2c_read(uint8_t reg);
 	void i2c_write(uint8_t reg, uint16_t v);
+	void shift_out(uint8_t plat, uint8_t pclk, uint8_t pdat, uint8_t v);
 };
 
 class PCF8575 : public IOEXP {
@@ -97,7 +100,7 @@ private:
 class PCF8574 : public IOEXP {
 public:
 	PCF8574(uint8_t addr) { address = addr; type = IOEXP_TYPE_8574; }
-	void pinMode(uint8_t pin, uint8_t IOMode) { 
+	void pinMode(uint8_t pin, uint8_t IOMode) {
 		if(IOMode!=OUTPUT) inputmask |= (1<<pin);
 	}
 	uint16_t i2c_read(uint8_t reg);
@@ -106,12 +109,9 @@ private:
 	uint8_t inputmask = 0;	// mask bits for input pins
 };
 
-//void pcf_write(int addr, byte data);
-//byte pcf_read(int addr);
-//void pcf_write16(int addr, uint16_t data);
-void pinModeExt(byte pin, byte mode);
-void digitalWriteExt(byte pin, byte value);
-byte digitalReadExt(byte pin);
+void pinModeExt(unsigned char pin, unsigned char mode);
+void digitalWriteExt(unsigned char pin, unsigned char value);
+unsigned char digitalReadExt(unsigned char pin);
 
 #endif	// ESP8266
 
@@ -124,16 +124,22 @@ byte digitalReadExt(byte pin);
 #include "defines.h"
 #define OUTPUT 0
 #define INPUT  1
-#define INPUT_PULLUP 1
-#define HIGH	 1
-#define LOW		 0
 
-void pinMode(int pin, byte mode);
-void digitalWrite(int pin, byte value);
+#if defined(OSPI)
+#define INPUT_PULLUP 2
+#else
+#define INPUT_PULLUP INPUT
+#endif
+
+#define HIGH   1
+#define LOW    0
+
+void pinMode(int pin, unsigned char mode);
+void digitalWrite(int pin, unsigned char value);
 int gpio_fd_open(int pin, int mode = O_WRONLY);
 void gpio_fd_close(int fd);
-void gpio_write(int fd, byte value);
-byte digitalRead(int pin);
+void gpio_write(int fd, unsigned char value);
+unsigned char digitalRead(int pin);
 // mode can be any of 'rising', 'falling', 'both'
 void attachInterrupt(int pin, const char* mode, void (*isr)(void));
 
